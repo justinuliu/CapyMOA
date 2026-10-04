@@ -17,6 +17,7 @@ from capymoa.exception import StreamTypeError
 from capymoa.stream import (
     ARFFStream,
     CSVStream,
+    FiniteStream,
     NumpyStream,
     Stream,
     generator,
@@ -1160,3 +1161,176 @@ def test_range_length_counts_gradual_windows():
     )
     assert with_gradual.length == 250
     assert with_abrupt.length == 200
+
+
+def _numpy_range_stream(**kwargs) -> NumpyStream:
+    X = np.arange(10).reshape(10, 1)
+    y = np.zeros(10, dtype=int)
+    return NumpyStream(X, y, **kwargs)
+
+
+def _xs(stream: Stream) -> list[int]:
+    return [int(instance.x[0]) for instance in stream]
+
+
+@pytest.mark.parametrize(
+    "start,end,expected",
+    [
+        (0, None, list(range(10))),
+        (3, None, list(range(3, 10))),
+        (0, 4, [0, 1, 2, 3]),
+        (-3, None, [7, 8, 9]),
+        (2, -6, [2, 3]),
+        (0.5, None, [5, 6, 7, 8, 9]),
+        (0.0, 0.2, [0, 1]),
+        (0.8, 1.0, [8, 9]),
+        (5, 100, [5, 6, 7, 8, 9]),
+        (-100, 2, [0, 1]),
+        (np.int64(1), np.int64(3), [1, 2]),
+    ],
+)
+def test_stream_range(start, end, expected):
+    stream = _numpy_range_stream(start=start, end=end)
+    assert len(stream) == len(expected)
+    assert _xs(stream) == expected
+    assert not stream.has_more_instances()
+    with pytest.raises(StopIteration):
+        stream.next_instance()
+
+
+def test_stream_range_restart_keeps_last_setting():
+    stream = _numpy_range_stream(start=2, end=5)
+    assert _xs(stream) == [2, 3, 4]
+    stream.restart()
+    assert _xs(stream) == [2, 3, 4]
+    stream.restart(start=3)
+    assert _xs(stream) == [3, 4]
+    stream.restart(end=-2)
+    assert _xs(stream) == [3, 4, 5, 6, 7]
+    stream.restart(start=0, end=1.0)
+    assert _xs(stream) == list(range(10))
+
+
+@pytest.mark.parametrize(
+    "start,end,error,match",
+    [
+        (5, 5, ValueError, "must come after"),
+        (5, 2, ValueError, "must come after"),
+        (-2, -5, ValueError, "must come after"),
+        (0.6, 0.4, ValueError, "must come after"),
+        (10, None, ValueError, "past the end"),
+        (1.5, None, ValueError, "from 0 to 1"),
+        (-0.1, None, ValueError, "from 0 to 1"),
+        (0, 1.5, ValueError, "from 0 to 1"),
+        ("1", None, TypeError, "int or a float"),
+        (True, None, TypeError, "int or a float"),
+    ],
+)
+def test_stream_range_rejects_bad_range(start, end, error, match):
+    with pytest.raises(error, match=match):
+        _numpy_range_stream(start=start, end=end)
+    stream = _numpy_range_stream()
+    with pytest.raises(error, match=match):
+        stream.restart(start=start, end=end)
+
+
+def test_stream_range_failed_restart_keeps_last_setting():
+    stream = _numpy_range_stream(start=2, end=4)
+    with pytest.raises(ValueError):
+        stream.restart(start=5)
+    stream.restart()
+    assert _xs(stream) == [2, 3]
+
+    stream = _numpy_range_stream(start=2)
+    with pytest.raises(ValueError, match="past the end"):
+        stream.restart(start=15)
+    assert len(stream) == 8
+    stream.restart()
+    assert _xs(stream) == list(range(2, 10))
+
+
+def test_stream_range_empty_stream():
+    X = np.empty((0, 1))
+    y = np.empty(0, dtype=int)
+    for start in [0, 0.0, -3]:
+        stream = NumpyStream(X, y, start=start)
+        assert len(stream) == 0
+        assert not stream.has_more_instances()
+    with pytest.raises(ValueError, match="past the end"):
+        NumpyStream(X, y, start=1)
+
+
+def test_stream_range_only_on_finite_streams():
+    for stream_class in [ARFFStream, CSVStream, NumpyStream]:
+        assert issubclass(stream_class, FiniteStream)
+    for stream in [
+        SEA(function=1),
+        DriftStream(stream=[SEA(1), AbruptDrift(10), SEA(2)]),
+    ]:
+        assert not isinstance(stream, FiniteStream)
+        with pytest.raises(TypeError):
+            stream.restart(start=5)
+
+
+def test_stream_range_arff_start_past_end():
+    stream = ARFFStream("data/electricity_tiny.arff")
+    n = sum(1 for _ in stream)
+    with pytest.raises(ValueError, match="past the end"):
+        stream.restart(start=n)
+
+
+@pytest.mark.parametrize(
+    "path", ["data/electricity_tiny.arff", "data/electricity_tiny.csv"]
+)
+def test_stream_range_from_file(path):
+    full = [instance.x for instance in stream_from_file(path)]
+    n = len(full)
+
+    stream = stream_from_file(path, start=10, end=20)
+    assert len(stream) == 10
+    assert allclose(np.array([i.x for i in stream]), np.array(full[10:20]))
+
+    stream.restart(start=-5, end=1.0)
+    assert len(stream) == 5
+    assert allclose(np.array([i.x for i in stream]), np.array(full[-5:]))
+
+    stream.restart(start=0.5, end=-10)
+    assert len(stream) == n - 10 - n // 2
+    assert allclose(np.array([i.x for i in stream]), np.array(full[n // 2 : -10]))
+
+
+def test_stream_range_csv_file_object():
+    from io import StringIO
+
+    rows = "\n".join(f"{i},{i % 2}" for i in range(10))
+    stream = CSVStream(StringIO("x,y\n" + rows + "\n"), target="y", start=-3)
+    assert len(stream) == 3
+    assert [int(i.x[0]) for i in stream] == [7, 8, 9]
+
+
+def test_stream_range_len_keeps_position():
+    """``len()`` must not move the stream."""
+    for stream in [
+        ARFFStream("data/electricity_tiny.arff"),
+        stream_from_file("data/electricity_tiny.csv"),
+    ]:
+        full = [i.x for i in stream]
+        stream.restart()
+        first = [stream.next_instance().x for _ in range(3)]
+        assert len(stream) == len(full)
+        rest = [i.x for i in stream]
+        assert allclose(np.array(first + rest), np.array(full))
+
+
+def test_stream_range_fast_evaluation_stops_at_end():
+    from capymoa.classifier import NoChange
+    from capymoa.evaluation import prequential_evaluation
+
+    stream = ARFFStream("data/electricity_tiny.arff", start=100, end=300)
+    learner = NoChange(stream.get_schema())
+    results = prequential_evaluation(stream, learner, store_y=True, optimise=True)
+    assert len(results.ground_truth_y()) == 200
+    results = prequential_evaluation(
+        stream, learner, max_instances=50, store_y=True, optimise=True
+    )
+    assert len(results.ground_truth_y()) == 50

@@ -4,7 +4,7 @@ from typing import Literal
 import pandas as pd
 
 from capymoa.stream._csv_stream import CSVStream
-from capymoa.stream._stream import ARFFStream, Stream
+from capymoa.stream._stream import ARFFStream, FiniteStream
 
 
 def stream_from_file(
@@ -12,7 +12,9 @@ def stream_from_file(
     dataset_name: str = "NoName",
     class_index: int = -1,
     target_type: Literal["numeric", "categorical"] | None = None,
-) -> Stream:
+    start: float = 0,
+    end: float | None = None,
+) -> FiniteStream:
     """Create a datastream from a csv or arff file.
 
     >>> from capymoa.stream import stream_from_file
@@ -72,6 +74,8 @@ def stream_from_file(
     :param target_type: When working with a CSV file, this parameter allows the user to
         specify the target values in the data to be interpreted as categorical or
         numeric. Defaults to None to detect automatically.
+    :param start: Index of the first instance to read. See :class:`FiniteStream`.
+    :param end: Index to stop reading at (excluded). See :class:`FiniteStream`.
     """
     filename = Path(path_to_csv_or_arff)
     if not filename.exists():
@@ -80,7 +84,9 @@ def stream_from_file(
         raise IsADirectoryError(f"Is a directory: '{filename}'")
 
     if filename.suffix == ".arff":
-        return ARFFStream(path=filename.as_posix(), class_index=class_index)
+        return ARFFStream(
+            path=filename.as_posix(), class_index=class_index, start=start, end=end
+        )
     elif filename.suffix == ".csv":
         # Read CSV file
         df = pd.read_csv(filename, na_values=["?", "NA", "NaN"])
@@ -108,7 +114,8 @@ def stream_from_file(
             categories=categories,
             target=target,
             name=dataset_name,
-            length=len(df),
+            start=start,
+            end=end,
         )
     else:
         raise ValueError(

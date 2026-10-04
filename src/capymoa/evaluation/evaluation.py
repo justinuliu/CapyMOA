@@ -40,7 +40,7 @@ from capymoa.base import (
 from capymoa.core import LabeledInstance, RegressionInstance
 from capymoa.evaluation._progress_bar import resolve_progress_bar
 from capymoa.evaluation.results import PrequentialResults
-from capymoa.stream import Schema, Stream
+from capymoa.stream import FiniteStream, Schema, Stream
 
 
 def _is_fast_mode_compilable(stream: Stream, learner, optimise=True) -> bool:
@@ -55,6 +55,18 @@ def _is_fast_mode_compilable(stream: Stream, learner, optimise=True) -> bool:
     is_moa_learner = hasattr(learner, "moa_learner") and learner.moa_learner is not None
 
     return is_moa_stream and is_moa_learner and optimise
+
+
+def _fast_max_instances(stream: Stream, max_instances: int | None) -> int | None:
+    """Return ``max_instances`` limited to the ``end`` of a finite stream.
+
+    The MOA evaluation loops read the MOA stream directly, so they do not see
+    the ``end`` of a :class:`~capymoa.stream.FiniteStream`.
+    """
+    if not isinstance(stream, FiniteStream):
+        return max_instances
+    remaining = stream._remaining()
+    return remaining if max_instances is None else min(max_instances, remaining)
 
 
 def _get_expected_length(
@@ -1463,6 +1475,7 @@ def _prequential_evaluation_fast(
             "`prequential_evaluation_fast` requires the stream object to have a`Stream.moa_stream`"
         )
 
+    max_instances = _fast_max_instances(stream, max_instances)
     if max_instances is None:
         max_instances = -1
 
@@ -1548,6 +1561,7 @@ def _prequential_ssl_evaluation_fast(
             "`prequential_evaluation_fast` requires the stream object to have a`Stream.moa_stream`"
         )
 
+    max_instances = _fast_max_instances(stream, max_instances)
     if max_instances is None:
         max_instances = -1
 
@@ -1631,6 +1645,7 @@ def _prequential_evaluation_anomaly_fast(
             "`prequential_evaluation_fast` requires the stream object to have a`Stream.moa_stream`"
         )
 
+    max_instances = _fast_max_instances(stream, max_instances)
     if max_instances is None:
         max_instances = -1
 

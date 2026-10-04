@@ -10,6 +10,7 @@ from capymoa._optional import lazy_torch_attrs
 # `isort: skip`.
 from ._stream import (  # isort: skip
     ARFFStream,
+    FiniteStream,
     MOAStream,
     NumpyStream,
     Schema,
@@ -22,6 +23,7 @@ from ._stream_from_file import stream_from_file
 __all__ = [
     "ARFFStream",
     "CSVStream",
+    "FiniteStream",
     "MOAStream",
     "NumpyStream",
     "Schema",

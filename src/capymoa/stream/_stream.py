@@ -1,3 +1,4 @@
+import numbers
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
@@ -408,6 +409,121 @@ class Stream(ABC, Iterator[_AnyInstance], Generic[_AnyInstance]):
         """Restart the stream to read instances from the beginning."""
 
 
+class FiniteStream(Stream[_AnyInstance]):
+    """A stream with an end, which can read part of its data.
+
+    The stream reads instances from index ``start`` up to, but not including,
+    index ``end`` (see :meth:`restart`). Each index can be:
+
+    * A positive integer counting from the start of the stream.
+    * A negative integer counting from the end of the stream.
+    * A float from 0 to 1 giving a proportion of the stream.
+
+    >>> from capymoa.stream import NumpyStream
+    >>> import numpy as np
+    >>> X = np.arange(10).reshape(10, 1)
+    >>> y = np.zeros(10, dtype=int)
+    >>> stream = NumpyStream(X, y, start=2, end=-5)
+    >>> [int(instance.x[0]) for instance in stream]
+    [2, 3, 4]
+    >>> stream.restart(start=1)
+    >>> [int(instance.x[0]) for instance in stream]
+    [1, 2, 3, 4]
+    >>> stream.restart(start=0.5, end=1.0)
+    >>> [int(instance.x[0]) for instance in stream]
+    [5, 6, 7, 8, 9]
+    >>> len(stream)
+    5
+    >>> stream.restart(start=8, end=-5)
+    Traceback (most recent call last):
+    ...
+    ValueError: end index 5 must come after start index 8
+
+    Subclasses implement :meth:`_has_more_instances`, :meth:`_next_instance`
+    and :meth:`_seek`, and call :meth:`__init__` once their data is ready.
+    """
+
+    def __init__(self, length: int, start: float = 0, end: float | None = None):
+        """Set the stream length and the part of the stream to read.
+
+        :param length: Number of instances in the whole stream.
+        :param start: Index of the first instance to read (included).
+        :param end: Index to stop reading at (excluded). ``None`` reads until
+            the stream ends.
+        :raises ValueError: If the range has no instances.
+        """
+        self._length = length
+        # ``start`` and ``end`` as positive integers. The whole stream at first.
+        self._start: int = 0
+        self._end: int = length
+        self.restart(start, end)
+
+    def __len__(self) -> int:
+        """Return the number of instances between ``start`` and ``end``."""
+        return self._end - self._start
+
+    def has_more_instances(self) -> bool:
+        return self._position < self._end and self._has_more_instances()
+
+    def next_instance(self) -> _AnyInstance:
+        if not self.has_more_instances():
+            raise StopIteration()
+        instance = self._next_instance()
+        self._position += 1
+        return instance
+
+    def restart(self, start: float | None = None, end: float | None = None) -> None:
+        """Restart the stream and read instances from ``start`` to ``end``.
+
+        ``None`` keeps the last value. Use ``start=0`` and ``end=1.0`` to read
+        the whole stream again.
+
+        :param start: Index of the first instance to read (included).
+        :param end: Index to stop reading at (excluded).
+        :raises ValueError: If the range has no instances.
+        """
+        length = self._length
+        start = self._start if start is None else self._resolve_index(start, "start")
+        end = self._end if end is None else min(self._resolve_index(end, "end"), length)
+        # An empty stream can still be read from its start.
+        if start > 0 and start >= length:
+            raise ValueError(
+                f"start index {start} is past the end of the stream, which has "
+                f"{length} instances"
+            )
+        if length > 0 and end <= start:
+            raise ValueError(f"end index {end} must come after start index {start}")
+        self._seek(start)
+        # ``_position`` is the index of the next instance.
+        self._start, self._end, self._position = start, end, start
+
+    def _resolve_index(self, value: float, name: str) -> int:
+        """Convert a start or end index into a positive integer."""
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise TypeError(f"{name} must be an int or a float, got {value!r}")
+        if isinstance(value, numbers.Integral):
+            return int(value) if value >= 0 else max(self._length + int(value), 0)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name}={value} is a float, so it must be from 0 to 1")
+        return int(value * self._length)
+
+    def _remaining(self) -> int:
+        """Return how many instances are left before ``end``."""
+        return self._end - self._position
+
+    @abstractmethod
+    def _has_more_instances(self) -> bool:
+        """Return ``True`` if the underlying data has more instances."""
+
+    @abstractmethod
+    def _next_instance(self) -> _AnyInstance:
+        """Return the next instance from the underlying data."""
+
+    @abstractmethod
+    def _seek(self, index: int) -> None:
+        """Move the underlying data to the instance at ``index``."""
+
+
 class MOAStream(Stream[_AnyInstance]):
     """A datastream that can be learnt instance by instance."""
 
@@ -508,14 +624,25 @@ class MOAStream(Stream[_AnyInstance]):
         self.moa_stream.restart()
 
 
-class ARFFStream(MOAStream[_AnyInstance]):
+class ARFFStream(FiniteStream[_AnyInstance], MOAStream[_AnyInstance]):
     """A datastream originating from an ARFF file."""
 
-    def __init__(self, path: str | Path, CLI: str | None = None, class_index: int = -1):
+    def __init__(
+        self,
+        path: str | Path,
+        CLI: str | None = None,
+        class_index: int = -1,
+        start: float = 0,
+        end: float | None = None,
+    ):
         """Construct an ARFFStream object from a file path.
+
+        Reads the file once to count the instances.
 
         :param path: A filepath
         :param CLI: Additional command line arguments to pass to the MOA stream.
+        :param start: Index of the first instance to read. See :class:`FiniteStream`.
+        :param end: Index to stop reading at (excluded). See :class:`FiniteStream`.
         """
         # convert 0-based index to 1-based index for MOA
         if class_index >= 0:
@@ -524,10 +651,26 @@ class ARFFStream(MOAStream[_AnyInstance]):
             raise ValueError("class_index must be -1 (last attribute) or >= 0")
 
         moa_stream = ArffFileStream(str(path), class_index)
-        super().__init__(moa_stream=moa_stream, CLI=CLI)
+        MOAStream.__init__(self, moa_stream=moa_stream, CLI=CLI)
+        length = 0
+        while moa_stream.hasMoreInstances():
+            moa_stream.nextInstance()
+            length += 1
+        FiniteStream.__init__(self, length, start, end)
+
+    def _has_more_instances(self) -> bool:
+        return self.moa_stream.hasMoreInstances()
+
+    def _next_instance(self) -> _AnyInstance:
+        return MOAStream.next_instance(self)
+
+    def _seek(self, index: int) -> None:
+        self.moa_stream.restart()
+        for _ in range(index):
+            self.moa_stream.nextInstance()
 
 
-class NumpyStream(Stream[_AnyInstance]):
+class NumpyStream(FiniteStream[_AnyInstance]):
     """A datastream originating from a numpy array.
 
     >>> from capymoa.stream import NumpyStream
@@ -562,6 +705,8 @@ class NumpyStream(Stream[_AnyInstance]):
         feature_names: Sequence[str] | None = None,
         target_name: str | None = None,
         target_type: Literal["numeric", "categorical"] = "categorical",
+        start: float = 0,
+        end: float | None = None,
     ):
         """Construct a NumpyStream object from a numpy array.
 
@@ -571,6 +716,8 @@ class NumpyStream(Stream[_AnyInstance]):
         :param feature_names: The names given to the features, defaults to None
         :param target_name: The name given to target values, defaults to None
         :param target_type: 'categorical' or 'numeric' target, defaults to None
+        :param start: Index of the first instance to read. See :class:`FiniteStream`.
+        :param end: Index to stop reading at (excluded). See :class:`FiniteStream`.
         """
 
         features = []
@@ -598,11 +745,12 @@ class NumpyStream(Stream[_AnyInstance]):
         self._len = X.shape[0]
         self._x_data = X
         self._y_data = y
+        super().__init__(self._len, start, end)
 
-    def has_more_instances(self):
+    def _has_more_instances(self):
         return self._len > self._index
 
-    def next_instance(self) -> _AnyInstance:
+    def _next_instance(self) -> _AnyInstance:
         # Raise StopIteration if there are no more instances
         if not self.has_more_instances():
             raise StopIteration()
@@ -625,11 +773,8 @@ class NumpyStream(Stream[_AnyInstance]):
     def get_schema(self):
         return self.schema
 
-    def restart(self):
-        self._index = 0
-
-    def __len__(self) -> int:
-        return self._len
+    def _seek(self, index: int) -> None:
+        self._index = index
 
 
 def _numpy_to_arff(

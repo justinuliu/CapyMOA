@@ -11,7 +11,7 @@ from capymoa.datasets._utils import (
     infer_unpacked_path,
 )
 from capymoa.stream import Stream, stream_from_file
-from capymoa.stream._stream import Schema
+from capymoa.stream._stream import FiniteStream, Schema
 
 FileType = Literal["arff", "csv"]
 
@@ -67,9 +67,9 @@ class _DownloadableDataset(ABC):
         return type(self).__name__
 
 
-class _DownloadableARFF(_DownloadableDataset, Stream):
+class _DownloadableARFF(_DownloadableDataset, FiniteStream):
     schema: Schema
-    stream: Stream
+    stream: FiniteStream
     moa_stream: _InstanceStream | None
     _target_type: Literal["numeric", "categorical"] | None = None
 
@@ -78,6 +78,8 @@ class _DownloadableARFF(_DownloadableDataset, Stream):
         directory: str | Path | None = None,
         auto_download: bool = True,
         file_type: FileType = "arff",
+        start: float = 0,
+        end: float | None = None,
     ):
         """Setup a stream from a dataset file and optionally download it if missing.
 
@@ -85,6 +87,10 @@ class _DownloadableARFF(_DownloadableDataset, Stream):
             Defaults to :func:`capymoa.datasets.get_download_dir`.
         :param auto_download: Download the dataset if it is missing.
         :param file_type: Download either the ``"arff"`` or ``"csv"`` dataset asset.
+        :param start: Index of the first instance to read. See
+            :class:`~capymoa.stream.FiniteStream`.
+        :param end: Index to stop reading at (excluded). See
+            :class:`~capymoa.stream.FiniteStream`.
         """
         if directory is None:
             directory = get_download_dir()
@@ -92,20 +98,25 @@ class _DownloadableARFF(_DownloadableDataset, Stream):
         self.stream = self.to_stream(self.path)
         self.schema = self.stream.get_schema()
         self.moa_stream = self.stream.get_moa_stream()
+        FiniteStream.__init__(self, self._length, start, end)
 
     @classmethod
-    def to_stream(cls, path: Path) -> Stream:
+    def to_stream(cls, path: Path) -> FiniteStream:
         return stream_from_file(
             path,
             dataset_name=cls.__name__,
             target_type=cls._target_type,
         )
 
-    def has_more_instances(self) -> bool:
+    def _has_more_instances(self) -> bool:
         return self.stream.has_more_instances()
 
-    def next_instance(self):
+    def _next_instance(self):
         return self.stream.next_instance()
+
+    def __len__(self) -> int:
+        # ``_DownloadableDataset.__len__`` comes first in the MRO.
+        return FiniteStream.__len__(self)
 
     def get_schema(self) -> Schema:
         return self.schema
@@ -113,5 +124,5 @@ class _DownloadableARFF(_DownloadableDataset, Stream):
     def get_moa_stream(self) -> _InstanceStream | None:
         return self.moa_stream
 
-    def restart(self):
-        self.stream.restart()
+    def _seek(self, index: int) -> None:
+        self.stream.restart(index)

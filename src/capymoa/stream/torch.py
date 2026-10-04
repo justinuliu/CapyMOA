@@ -5,7 +5,7 @@ from torch.utils.data import Dataset
 
 from capymoa.core import LabeledInstance, RegressionInstance
 
-from ._stream import Schema, Stream
+from ._stream import FiniteStream, Schema
 
 
 def _shuffle_dataset(dataset: Dataset, seed: int | None = None) -> Dataset:
@@ -16,7 +16,7 @@ def _shuffle_dataset(dataset: Dataset, seed: int | None = None) -> Dataset:
     return torch.utils.data.Subset(dataset, indicies)
 
 
-class TorchStream(Stream):
+class TorchStream(FiniteStream):
     """A stream adapter for PyTorch datasets.
 
     This class converts PyTorch datasets into CapyMOA streams for both classification
@@ -153,6 +153,8 @@ class TorchStream(Stream):
         self,
         dataset: Dataset,
         schema: Schema,
+        start: float = 0,
+        end: float | None = None,
     ):
         """Construct a TorchStream from a PyTorch Dataset and a Schema.
 
@@ -161,15 +163,18 @@ class TorchStream(Stream):
         :param dataset: A PyTorch Dataset that yields tuples of (features, target).
         :param schema: A Schema object that describes the structure of the data,
             including feature names and target information.
+        :param start: Index of the first instance to read. See :class:`FiniteStream`.
+        :param end: Index to stop reading at (excluded). See :class:`FiniteStream`.
         """
         self._dataset = dataset
         self.schema = schema
         self._index = 0
+        super().__init__(len(dataset), start, end)
 
-    def has_more_instances(self):
+    def _has_more_instances(self):
         return len(self._dataset) > self._index
 
-    def next_instance(self):
+    def _next_instance(self):
         if not self.has_more_instances():
             raise StopIteration()
 
@@ -197,8 +202,5 @@ class TorchStream(Stream):
     def get_moa_stream(self):
         return None
 
-    def restart(self):
-        self._index = 0
-
-    def __len__(self) -> int:
-        return len(self._dataset)
+    def _seek(self, index: int) -> None:
+        self._index = index
