@@ -6,6 +6,7 @@ Learn how to group data streams into clusters that evolve as new instances arriv
 :maxdepth: 1
 
 clustering
+monic
 ```
 
 ```{admonition} See also
