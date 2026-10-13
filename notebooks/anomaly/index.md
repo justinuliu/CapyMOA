@@ -6,6 +6,7 @@ Learn how to identify anomalous instances in data streams as they arrive.
 :maxdepth: 1
 
 anomaly_detection
+anomaly_drift_stream
 ```
 
 ```{admonition} See also

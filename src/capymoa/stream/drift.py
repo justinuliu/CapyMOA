@@ -6,13 +6,16 @@ import math
 import random as _random
 import re
 from collections import OrderedDict
+from collections.abc import Sequence
 from itertools import cycle, pairwise
 
+import numpy as np
 from moa.streams import ConceptDriftStream as MOA_ConceptDriftStream
 
+from capymoa.core import LabeledInstance
 from capymoa.core.moa._cli import cli_str_stream
 
-from ._stream import MOAStream, Stream
+from ._stream import MOAStream, Schema, Stream
 
 #: Named transition ramps. Each maps progress through the drift window,
 #: ``0.0`` at the start and ``1.0`` at the end, to the probability that an
@@ -1192,3 +1195,163 @@ class RecurrentConceptDriftStream(DriftStream):
         )
 
         super().__init__(stream=stream_list)
+
+
+class AnomalyDriftStream(DriftStream):
+    """A drift stream for anomaly detection.
+
+    The stream is defined like a :class:`DriftStream`, in either form.
+    Instances from the concepts are normal. A share of the stream,
+    ``anomaly_rate``, is replaced with anomalies drawn uniformly over
+    ``bounds``. The target is ``is_anomaly``: ``0`` for a normal instance and
+    ``1`` for an anomaly.
+
+    >>> from capymoa.stream.drift import AbruptDrift, AnomalyDriftStream
+    >>> from capymoa.stream.generator import RandomRBFGenerator
+    >>> stream = AnomalyDriftStream(
+    ...     stream=[
+    ...         RandomRBFGenerator(model_random_seed=1),
+    ...         AbruptDrift(position=1000),
+    ...         RandomRBFGenerator(model_random_seed=2),
+    ...     ],
+    ...     anomaly_rate=0.05,
+    ...     random_seed=1,
+    ... )
+    >>> stream.get_schema().get_label_values()
+    ['0', '1']
+    >>> sum(stream.next_instance().y_index for _ in range(2000))
+    106
+
+    An anomaly takes the place of the instance the concept would have given.
+    Drift positions, the stream length and :func:`get_concept_counts` are
+    therefore those of the :class:`DriftStream` with the same definition.
+
+    The class labels of the concepts are not used, so a drift only shows when
+    the concepts differ in their features. ``SEA(function=1)`` and
+    ``SEA(function=3)`` draw features the same way and differ only in how they
+    label them, which makes them one concept here.
+
+    ``bounds`` is the range anomalies are drawn from. Give one ``(low, high)``
+    pair for all features, or one pair per feature. When omitted, the range of
+    each feature is measured on the first ``bounds_sample_size`` instances of
+    every concept, and the concepts are then restarted. The same bounds apply
+    to the whole stream, so the anomalies do not drift. Nominal features ignore
+    ``bounds`` and take one of their values at random.
+
+    Anomalies are uniform over the bounds, so some land where normal instances
+    are common, and no detector can tell those apart. Concepts that also draw
+    their features uniformly, such as SEA, leave nothing to detect.
+    """
+
+    def __init__(
+        self,
+        stream: list,
+        anomaly_rate: float = 0.01,
+        bounds: tuple[float, float] | Sequence[tuple[float, float]] | None = None,
+        bounds_sample_size: int = 1000,
+        random_seed: int | None = None,
+    ):
+        """Initialize the stream.
+
+        :param stream: The list of concepts and drifts to compose, as for
+            :class:`DriftStream`.
+        :param anomaly_rate: The probability that an instance is an anomaly.
+        :param bounds: The range anomalies are drawn from, as one
+            ``(low, high)`` pair or one pair per feature. Measured on the
+            concepts when not given.
+        :param bounds_sample_size: How many instances of each concept to
+            measure the bounds on. Only used when ``bounds`` is not given.
+        :param random_seed: Seed for placing and drawing the anomalies. When
+            not given, each new stream has different anomalies. A stream always
+            repeats when restarted.
+        """
+        if not 0.0 <= anomaly_rate <= 1.0:
+            raise ValueError(
+                f"anomaly_rate must be between 0 and 1, got {anomaly_rate!r}."
+            )
+        super().__init__(stream=stream)
+        self.anomaly_rate = anomaly_rate
+        self.random_seed = random_seed
+        # Drawn once, so a stream with no seed still repeats when restarted.
+        self._seed_sequence = np.random.SeedSequence(random_seed)
+
+        concept_schema = self._schema
+        header = concept_schema.get_moa_header()
+        features = [
+            header.attribute(i)
+            for i in range(header.numAttributes())
+            if i != header.classIndex()
+        ]
+        # A nominal feature holds the index of its value, so an anomaly takes
+        # an index instead of a point in ``bounds``.
+        self._nominal = np.array([bool(f.isNominal()) for f in features])
+        low, high = self._resolve_bounds(bounds, bounds_sample_size)
+        num_values = [f.numValues() for f in features if f.isNominal()]
+        low[self._nominal], high[self._nominal] = 0.0, num_values
+        self._low, self._high = low, high
+
+        target = "is_anomaly"
+        self._schema = Schema.from_custom(
+            features=[*(str(f.name()) for f in features), target],
+            target=target,
+            categories={**concept_schema.get_nominal_attributes(), target: ["0", "1"]},
+            name="AnomalyDriftStream",
+        )
+        self._rng = np.random.default_rng(self._seed_sequence)
+
+    def _resolve_bounds(self, bounds, sample_size):
+        """Return the lowest and highest value an anomaly takes per feature."""
+        if bounds is None:
+            # Read every concept from its start, then put it back there.
+            self.restart()
+            sample = np.array(
+                [
+                    concept.next_instance().x
+                    for concept in self._concepts
+                    for _ in range(sample_size)
+                    if concept.has_more_instances()
+                ]
+            )
+            self.restart()
+            return np.nanmin(sample, axis=0), np.nanmax(sample, axis=0)
+
+        num_features = len(self._nominal)
+        bounds = np.array(bounds, dtype=float)
+        if bounds.shape == (2,):
+            bounds = np.tile(bounds, (num_features, 1))
+        if bounds.shape != (num_features, 2):
+            raise ValueError(
+                "bounds must be one (low, high) pair, or one pair for each of "
+                f"the {num_features} features. Got shape {bounds.shape}."
+            )
+        low, high = bounds[:, 0], bounds[:, 1]
+        if not np.all(low <= high):
+            raise ValueError("Each bound must have low <= high.")
+        return low, high
+
+    def next_instance(self):
+        # Drawn even when an anomaly takes its place, so the concepts advance
+        # exactly as they do in the ``DriftStream`` with the same definition.
+        instance = super().next_instance()
+        if self._rng.random() >= self.anomaly_rate:
+            return LabeledInstance.from_array(self._schema, instance.x, 0)
+
+        x = self._low + (self._high - self._low) * self._rng.random(len(self._low))
+        x[self._nominal] = np.floor(x[self._nominal])
+        return LabeledInstance.from_array(self._schema, x, 1)
+
+    def restart(self):
+        super().restart()
+        self._rng = np.random.default_rng(self._seed_sequence)
+
+    def to_moa_stream(self):
+        """Not supported, because MOA cannot represent the injected anomalies."""
+        raise ValueError(
+            "AnomalyDriftStream has no MOA equivalent: MOA's ConceptDriftStream "
+            "cannot inject anomalies."
+        )
+
+    def __str__(self):
+        return (
+            f"AnomalyDriftStream({super().__str__()}, anomaly_rate={self.anomaly_rate})"
+        )

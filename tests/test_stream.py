@@ -24,6 +24,7 @@ from capymoa.stream import (
 )
 from capymoa.stream.drift import (
     AbruptDrift,
+    AnomalyDriftStream,
     Concept,
     Drift,
     DriftStream,
@@ -1160,3 +1161,212 @@ def test_range_length_counts_gradual_windows():
     )
     assert with_gradual.length == 250
     assert with_abrupt.length == 200
+
+
+def _rbf_definition():
+    """Two concepts that differ in their features, which is what a detector sees."""
+    return [
+        RandomRBFGenerator(model_random_seed=1),
+        AbruptDrift(position=500),
+        RandomRBFGenerator(model_random_seed=2),
+    ]
+
+
+def test_anomaly_drift_stream_replaces_instances_with_anomalies():
+    """Anomalies take the place of instances; the rest is the plain DriftStream."""
+    stream = AnomalyDriftStream(
+        stream=_rbf_definition(),
+        anomaly_rate=0.1,
+        bounds=(100.0, 101.0),
+        random_seed=1,
+    )
+    plain = DriftStream(stream=_rbf_definition())
+
+    anomalies = 0
+    for _ in range(1000):
+        instance, expected = stream.next_instance(), plain.next_instance()
+        if instance.y_index == 1:
+            anomalies += 1
+            # The bounds sit far from the concepts, so an anomaly cannot be
+            # mistaken for a relabelled normal instance.
+            assert np.all((instance.x >= 100.0) & (instance.x < 101.0))
+        else:
+            assert np.allclose(instance.x, expected.x)
+
+    # 100 expected, with a standard deviation of about 9.5.
+    assert 60 < anomalies < 140
+    assert [str(d) for d in stream.get_drifts()] == ["AbruptDrift(position=500)"]
+
+
+def test_anomaly_drift_stream_schema_is_binary():
+    """The features are kept and the target says whether it is an anomaly."""
+    concept = RandomRBFGenerator()
+    schema = AnomalyDriftStream(stream=_rbf_definition()).get_schema()
+
+    assert schema.is_classification()
+    assert schema.get_label_values() == ["0", "1"]
+    assert schema.get_numeric_attributes() == (
+        concept.get_schema().get_numeric_attributes()
+    )
+    assert schema.get_num_attributes() == concept.get_schema().get_num_attributes()
+
+
+def test_anomaly_drift_stream_measures_bounds_over_every_concept():
+    """Measured bounds span all concepts, and measuring leaves them unread."""
+    rng = np.random.default_rng(0)
+    low_x, high_x = rng.random((200, 3)), rng.random((200, 3)) + 10
+    y = rng.integers(0, 2, 200)
+
+    def definition():
+        return [
+            NumpyStream(low_x, y, "low"),
+            AbruptDrift(position=100),
+            NumpyStream(high_x, y, "high"),
+        ]
+
+    stream = AnomalyDriftStream(stream=definition(), anomaly_rate=0.5, random_seed=1)
+    plain = DriftStream(stream=definition())
+
+    anomalies = []
+    for _ in range(200):
+        instance, expected = stream.next_instance(), plain.next_instance()
+        if instance.y_index == 1:
+            anomalies.append(instance.x)
+        else:
+            assert np.allclose(instance.x, expected.x)
+    anomalies = np.array(anomalies)
+
+    assert np.all(anomalies >= low_x.min(axis=0))
+    assert np.all(anomalies <= high_x.max(axis=0))
+    # Neither concept has values here, so only the span of both explains it.
+    assert np.any((anomalies > 2) & (anomalies < 9))
+
+
+def test_anomaly_drift_stream_accepts_bounds_per_feature():
+    """Each feature can have its own range."""
+    bounds = [(0.0, 1.0), (5.0, 6.0), (-3.0, -2.0)]
+    stream = AnomalyDriftStream(
+        stream=[SEA(function=1)], anomaly_rate=1.0, bounds=bounds
+    )
+    x = np.array([stream.next_instance().x for _ in range(100)])
+
+    for column, (low, high) in zip(x.T, bounds):
+        assert np.all((column >= low) & (column < high))
+
+
+def test_anomaly_drift_stream_gives_nominal_features_a_valid_value():
+    """A nominal feature holds a value index, so bounds do not apply to it."""
+    concept = RandomTreeGenerator()
+    nominal = concept.get_schema().get_nominal_attributes()
+    stream = AnomalyDriftStream(
+        stream=[concept], anomaly_rate=1.0, bounds=(100.0, 101.0), random_seed=1
+    )
+    assert stream.get_schema().get_nominal_attributes() == nominal
+
+    instances = [stream.next_instance() for _ in range(100)]
+    x = np.array([instance.x for instance in instances])
+    is_nominal = x.max(axis=0) < 100.0
+
+    assert is_nominal.sum() == len(nominal)
+    assert np.all(x[:, is_nominal] == np.floor(x[:, is_nominal]))
+    assert x[:, is_nominal].min() == 0
+    assert x[:, is_nominal].max() == max(len(v) for v in nominal.values()) - 1
+    # MOA rejects an index outside the values of a nominal attribute.
+    assert instances[0].java_instance.toString()
+
+
+@pytest.mark.parametrize("random_seed", [1, None])
+def test_anomaly_drift_stream_restart_repeats_the_stream(random_seed):
+    """A restart repeats the stream, with or without a seed."""
+    stream = AnomalyDriftStream(
+        stream=_rbf_definition(), anomaly_rate=0.1, random_seed=random_seed
+    )
+    first = [stream.next_instance() for _ in range(300)]
+    stream.restart()
+    again = [stream.next_instance() for _ in range(300)]
+
+    assert [a.y_index for a in first] == [b.y_index for b in again]
+    assert np.array_equal([a.x for a in first], [b.x for b in again])
+    # Without a seed there must still be anomalies to repeat.
+    assert sum(a.y_index for a in first) > 0
+
+
+def test_anomaly_drift_stream_seed_decides_the_anomalies():
+    """A seed fixes the anomalies, and no seed gives new ones each time."""
+
+    def read(random_seed=None):
+        stream = AnomalyDriftStream(
+            stream=_rbf_definition(), anomaly_rate=0.1, random_seed=random_seed
+        )
+        return [stream.next_instance().y_index for _ in range(300)]
+
+    assert read(random_seed=1) == read(random_seed=1)
+    assert read(random_seed=1) != read(random_seed=2)
+    assert read() != read()
+
+
+def test_anomaly_drift_stream_keeps_the_range_form_length():
+    """Anomalies replace instances, so they do not make the stream longer."""
+    stream = AnomalyDriftStream(
+        stream=[
+            Concept(RandomRBFGenerator(model_random_seed=1), num_instances=300),
+            GradualDrift(num_instances=100),
+            Concept(RandomRBFGenerator(model_random_seed=2), num_instances=300),
+        ],
+        anomaly_rate=0.1,
+    )
+    assert stream.length == 700
+    assert str(stream.get_drifts()[0]) == (
+        "GradualDrift(position=350, start=300, end=400, width=100)"
+    )
+
+    consumed = 0
+    while stream.has_more_instances():
+        stream.next_instance()
+        consumed += 1
+    assert consumed == 700
+
+
+@pytest.mark.parametrize(
+    ["kwargs", "match"],
+    [
+        ({"anomaly_rate": -0.1}, "anomaly_rate"),
+        ({"anomaly_rate": 1.5}, "anomaly_rate"),
+        ({"bounds": (0.0, 1.0, 2.0)}, "bounds must be"),
+        ({"bounds": [(0.0, 1.0), (0.0, 1.0)]}, "bounds must be"),
+        ({"bounds": (1.0, 0.0)}, "low <= high"),
+    ],
+)
+def test_anomaly_drift_stream_rejects_bad_arguments(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        AnomalyDriftStream(stream=[SEA(function=1)], **kwargs)
+
+
+def test_anomaly_drift_stream_has_no_moa_equivalent():
+    """MOA cannot inject anomalies, so the evaluation loop must stay in Python."""
+    stream = AnomalyDriftStream(stream=_rbf_definition())
+
+    assert stream.get_moa_stream() is None
+    with pytest.raises(ValueError, match="no MOA equivalent"):
+        stream.to_moa_stream()
+
+
+def test_anomaly_drift_stream_can_be_evaluated():
+    """The stream works with the anomaly evaluation loop, and is learnable."""
+    # Imported here because no other test in this module needs a learner.
+    from capymoa.anomaly import OnlineIsolationForest
+    from capymoa.evaluation import prequential_evaluation_anomaly
+
+    stream = AnomalyDriftStream(
+        stream=_rbf_definition(), anomaly_rate=0.05, random_seed=1
+    )
+    results = prequential_evaluation_anomaly(
+        stream=stream,
+        learner=OnlineIsolationForest(schema=stream.get_schema()),
+        max_instances=1000,
+        window_size=500,
+    )
+
+    # Uniform anomalies are far from the RBF clusters, so a working stream
+    # gives a detector much more than the 0.5 of a random score.
+    assert results.auc() > 0.7
