@@ -7,6 +7,7 @@ from jpype import JArray, JDouble
 from moa.core import InstanceExample
 from numpy import double
 from numpy.typing import NDArray
+from itertools import count
 
 # Schema is only imported for type hinting. If we were to import Schema directly
 # in this file, it would create a circular import.
@@ -72,6 +73,8 @@ class Instance:
     a class label or target value respectively.
     """
 
+    id_counter = count(start=0)
+
     def __init__(
         self, schema: "Schema", instance: InstanceExample | FeatureVector
     ) -> None:
@@ -95,6 +98,8 @@ class Instance:
             self._x = instance.astype(np.double)
         else:
             raise TypeError(f"Given instance type unsupported: {type(instance)}")
+
+        self._id = next(Instance.id_counter)
 
     @classmethod
     def from_java_instance(
