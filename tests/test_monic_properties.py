@@ -6,7 +6,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from capymoa.evaluation.monic import (
-    ClusteringSnapshot,
+    Clustering,
     ExternalKind,
     Lifetime,
     advance_lifetimes,
@@ -19,7 +19,7 @@ WEIGHTS = [0.0, 0.25, 0.5, 1.0]
 
 
 @st.composite
-def clustering_pairs(draw: st.DrawFn) -> tuple[ClusteringSnapshot, ClusteringSnapshot]:
+def clustering_pairs(draw: st.DrawFn) -> tuple[Clustering, Clustering]:
     """Two clusterings over a shared pool of records.
 
     Each record is independently placed in a cluster of each clustering or left
@@ -44,8 +44,8 @@ def clustering_pairs(draw: st.DrawFn) -> tuple[ClusteringSnapshot, ClusteringSna
 
     source_weights = dict.fromkeys(range(n_records), 1.0)
     return (
-        ClusteringSnapshot(0, source_clusters, source_weights),
-        ClusteringSnapshot(1, target_clusters, target_weights),
+        Clustering(0, source_clusters, source_weights),
+        Clustering(1, target_clusters, target_weights),
     )
 
 
@@ -56,7 +56,7 @@ def clustering_pairs(draw: st.DrawFn) -> tuple[ClusteringSnapshot, ClusteringSna
     tau_split=st.sampled_from([0.1, 0.25, 0.4]),
 )
 def test_external_transitions_label_every_cluster_once(
-    pair: tuple[ClusteringSnapshot, ClusteringSnapshot], tau: float, tau_split: float
+    pair: tuple[Clustering, Clustering], tau: float, tau_split: float
 ):
     source, target = pair
     transitions = detect_external_transitions(source, target, tau, tau_split)
@@ -104,14 +104,14 @@ def test_external_transitions_label_every_cluster_once(
 
 
 @st.composite
-def histories(draw: st.DrawFn) -> list[ClusteringSnapshot]:
+def histories(draw: st.DrawFn) -> list[Clustering]:
     """Clusterings at successive timepoints over a shared pool of records.
 
     At each timepoint a record is either clustered, with a weight and a point,
     or has aged out.
     """
     n_records = draw(st.integers(1, 16))
-    snapshots = []
+    clusterings = []
     for timepoint in range(draw(st.integers(2, 6))):
         clusters: dict[int, set[int]] = {}
         weights: dict[int, float] = {}
@@ -122,16 +122,16 @@ def histories(draw: st.DrawFn) -> list[ClusteringSnapshot]:
                 clusters.setdefault(cluster, set()).add(record)
                 weights[record] = draw(st.sampled_from([0.5, 1.0]))
                 points[record] = [float(draw(st.integers(0, 2)))]
-        snapshots.append(ClusteringSnapshot(timepoint, clusters, weights, points))
-    return snapshots
+        clusterings.append(Clustering(timepoint, clusters, weights, points))
+    return clusterings
 
 
 @settings(max_examples=300, deadline=None, derandomize=True, database=None)
-@given(snapshots=histories(), tau=st.sampled_from([0.5, 0.6, 0.75]))
-def test_lifetimes_are_ordered(snapshots: list[ClusteringSnapshot], tau: float):
+@given(clusterings=histories(), tau=st.sampled_from([0.5, 0.6, 0.75]))
+def test_lifetimes_are_ordered(clusterings: list[Clustering], tau: float):
     lifetimes: dict[int, Lifetime] = {}
-    source = ClusteringSnapshot(-1, {}, {})
-    for n_timepoints, target in enumerate(snapshots, start=1):
+    source = Clustering(-1, {}, {})
+    for n_timepoints, target in enumerate(clusterings, start=1):
         external = detect_external_transitions(source, target, tau, 0.1)
         internal = detect_internal_transitions(source, target, external)
         lifetimes = advance_lifetimes(lifetimes, source, target, external, internal)

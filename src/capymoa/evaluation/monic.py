@@ -6,10 +6,11 @@ was split or disappeared, which clusters emerged, and how the survivors changed.
 
 There are two ways in:
 
-* :py:class:`MONIC` takes one :py:class:`ClusteringSnapshot` per timepoint. Use
+* :py:class:`MONIC` takes one :py:class:`Clustering` per timepoint. Use
   it when you cluster the data of each timepoint yourself, as the paper does.
-* :py:class:`MONICMonitor` wraps a CapyMOA clusterer and a stream, and builds
-  the snapshots itself.
+* :py:class:`MONICMonitor` trains a clusterer on a stream and asks it for its
+  clustering at every timepoint. The clusterer must implement
+  :py:class:`MonitorableClusterer`.
 
 See ``docs/MONIC-design.md`` for the decisions taken where the paper is silent.
 
@@ -21,12 +22,12 @@ See ``docs/MONIC-design.md`` for the decisions taken where the paper is silent.
 
 import warnings
 from abc import ABC, abstractmethod
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 
@@ -36,18 +37,15 @@ from capymoa.stream import Stream
 
 __all__ = [
     "MONIC",
-    "AgeingFunction",
-    "ClusteringSnapshot",
-    "ExponentialDecay",
+    "Clustering",
     "ExternalKind",
     "ExternalTransition",
     "InternalKind",
     "InternalTransition",
     "Lifetime",
     "MONICMonitor",
+    "MonitorableClusterer",
     "PassforwardRatios",
-    "RecordBuffer",
-    "SlidingWindow",
     "TransitionReport",
     "advance_lifetimes",
     "build_overlap_matrix",
@@ -55,23 +53,22 @@ __all__ = [
     "detect_internal_transitions",
     "overlap",
     "passforward_ratios",
-    "snapshot_from_clusterer",
 ]
 
 
 @dataclass(frozen=True)
-class ClusteringSnapshot:
+class Clustering:
     """A clustering at one timepoint, with record-level membership.
 
     The row and column order of an overlap matrix follows the iteration order of
     :py:attr:`clusters`.
 
-    >>> snapshot = ClusteringSnapshot(
+    >>> clustering = Clustering(
     ...     timepoint=0,
     ...     clusters={0: {1, 2}, 1: {3}},
     ...     weights={1: 1.0, 2: 1.0, 3: 0.5},
     ... )
-    >>> snapshot.cluster_ids
+    >>> clustering.cluster_ids
     (0, 1)
 
     :raises ValueError: If a record belongs to more than one cluster, a
@@ -83,7 +80,7 @@ class ClusteringSnapshot:
     """The timepoint at which the clustering was built."""
     clusters: Mapping[int, AbstractSet[int]]
     """Maps a cluster id to the ids of its records. Cluster ids are only
-    meaningful within this snapshot. Clusters must be disjoint."""
+    meaningful within this clustering. Clusters must be disjoint."""
     weights: Mapping[int, float]
     """Maps a record id to its ageing weight ``age(record, timepoint)`` in
     ``[0, 1]``. It covers every record alive at this timepoint, including
@@ -137,7 +134,7 @@ class ClusteringSnapshot:
             return None
         return len(next(iter(self.points.values())))
 
-    def without_clusters(self, cluster_ids: Iterable[int]) -> "ClusteringSnapshot":
+    def without_clusters(self, cluster_ids: Iterable[int]) -> "Clustering":
         """Turn the records of some clusters into noise.
 
         Use it on a garbage cluster: one into which a clusterer puts the records
@@ -146,12 +143,12 @@ class ClusteringSnapshot:
         belong to no cluster, so they still count against the overlap of the
         clusters they came from.
 
-        >>> snapshot = ClusteringSnapshot(0, {0: {1, 2}, 1: {3}}, {1: 1.0, 2: 1.0, 3: 1.0})
-        >>> snapshot.without_clusters([0]).clusters
+        >>> clustering = Clustering(0, {0: {1, 2}, 1: {3}}, {1: 1.0, 2: 1.0, 3: 1.0})
+        >>> clustering.without_clusters([0]).clusters
         {1: frozenset({3})}
 
         :param cluster_ids: The ids of the clusters to dissolve.
-        :return: A snapshot without those clusters and with the same weights.
+        :return: A clustering without those clusters and with the same weights.
         """
         dropped = set(cluster_ids)
         clusters = {
@@ -159,7 +156,7 @@ class ClusteringSnapshot:
             for cluster_id, records in self.clusters.items()
             if cluster_id not in dropped
         }
-        return ClusteringSnapshot(self.timepoint, clusters, self.weights, self.points)
+        return Clustering(self.timepoint, clusters, self.weights, self.points)
 
 
 def overlap(
@@ -186,9 +183,7 @@ def overlap(
     return sum(weights.get(record, 0.0) for record in x & y) / denominator
 
 
-def build_overlap_matrix(
-    source: ClusteringSnapshot, target: ClusteringSnapshot
-) -> np.ndarray:
+def build_overlap_matrix(source: Clustering, target: Clustering) -> np.ndarray:
     """Overlap of every cluster of ``source`` to every cluster of ``target``.
 
     Uses an inverted index from record id to the cluster of ``target``, then a
@@ -196,8 +191,8 @@ def build_overlap_matrix(
     allocating the matrix, the cost is linear in the number of records rather
     than in the number of cluster pairs.
 
-    >>> source = ClusteringSnapshot(0, {0: {1, 2, 3, 4}}, dict.fromkeys(range(1, 5), 1.0))
-    >>> target = ClusteringSnapshot(1, {7: {1, 2, 3}, 8: {4}}, dict.fromkeys(range(1, 5), 1.0))
+    >>> source = Clustering(0, {0: {1, 2, 3, 4}}, dict.fromkeys(range(1, 5), 1.0))
+    >>> target = Clustering(1, {7: {1, 2, 3}, 8: {4}}, dict.fromkeys(range(1, 5), 1.0))
     >>> build_overlap_matrix(source, target).tolist()
     [[0.75, 0.25]]
 
@@ -214,7 +209,7 @@ def build_overlap_matrix(
 
 
 def _intersection_weights(
-    source: ClusteringSnapshot, target: ClusteringSnapshot
+    source: Clustering, target: Clustering
 ) -> tuple[np.ndarray, np.ndarray]:
     """Numerators and denominators of Definition 3, using the weights of ``target``.
 
@@ -280,8 +275,8 @@ class ExternalTransition:
 
 
 def detect_external_transitions(
-    source: ClusteringSnapshot,
-    target: ClusteringSnapshot,
+    source: Clustering,
+    target: Clustering,
     tau: float = 0.5,
     tau_split: float = 0.1,
 ) -> tuple[ExternalTransition, ...]:
@@ -295,8 +290,8 @@ def detect_external_transitions(
     by at least ``tau_split`` together overlap it by at least ``tau``; otherwise
     it disappears.
 
-    >>> source = ClusteringSnapshot(0, {0: {1, 2}, 1: {3, 4}}, dict.fromkeys(range(1, 5), 1.0))
-    >>> target = ClusteringSnapshot(1, {7: {1, 2, 5}, 8: {6}}, {1: 1.0, 2: 1.0, 5: 1.0, 6: 1.0})
+    >>> source = Clustering(0, {0: {1, 2}, 1: {3, 4}}, dict.fromkeys(range(1, 5), 1.0))
+    >>> target = Clustering(1, {7: {1, 2, 5}, 8: {6}}, {1: 1.0, 2: 1.0, 5: 1.0, 6: 1.0})
     >>> for transition in detect_external_transitions(source, target):
     ...     print(transition.kind.name, transition.source, transition.targets)
     SURVIVED 0 (7,)
@@ -333,7 +328,7 @@ def _check_external_thresholds(tau: float, tau_split: float) -> None:
 
 
 def _external_transitions(
-    source: ClusteringSnapshot, target: ClusteringSnapshot, tau: float, tau_split: float
+    source: Clustering, target: Clustering, tau: float, tau_split: float
 ) -> tuple[ExternalTransition, ...]:
     """:py:func:`detect_external_transitions` without the threshold checks."""
     intersections, totals = _intersection_weights(source, target)
@@ -441,20 +436,20 @@ class _Statistics(NamedTuple):
     skewness: np.ndarray
 
 
-def _statistics(snapshot: ClusteringSnapshot, cluster_id: int) -> _Statistics | None:
-    """Weighted statistics of a cluster, using the weights of its own snapshot.
+def _statistics(clustering: Clustering, cluster_id: int) -> _Statistics | None:
+    """Weighted statistics of a cluster, using the weights of its own clustering.
 
     :return: The weight of the cluster, its mean, the root mean square distance
         of its records to the mean and its skewness in each feature, or ``None``
         if the cluster has no weight.
     """
-    records = sorted(snapshot.clusters[cluster_id])
-    weights = np.array([snapshot.weights[record] for record in records])
+    records = sorted(clustering.clusters[cluster_id])
+    weights = np.array([clustering.weights[record] for record in records])
     total = weights.sum()
     if total == 0.0:
         return None
 
-    points = np.array([snapshot.points[record] for record in records])
+    points = np.array([clustering.points[record] for record in records])
     mean = weights @ points / total
     centred = points - mean
     variance = weights @ centred**2 / total
@@ -479,8 +474,8 @@ def _check_internal_thresholds(
 
 
 def detect_internal_transitions(
-    source: ClusteringSnapshot,
-    target: ClusteringSnapshot,
+    source: Clustering,
+    target: Clustering,
     transitions: Iterable[ExternalTransition],
     epsilon: float = 0.1,
     delta: float = 0.1,
@@ -499,10 +494,10 @@ def detect_internal_transitions(
     clusterings do not both carry points with the same number of features, every
     cluster is reported as skipped instead.
 
-    >>> source = ClusteringSnapshot(
+    >>> source = Clustering(
     ...     0, {0: {1, 2}}, {1: 1.0, 2: 1.0}, {1: [0.0], 2: [2.0]}
     ... )
-    >>> target = ClusteringSnapshot(
+    >>> target = Clustering(
     ...     1, {7: {1, 2, 3}}, {1: 1.0, 2: 1.0, 3: 1.0}, {1: [0.0], 2: [2.0], 3: [1.0]}
     ... )
     >>> external = detect_external_transitions(source, target)
@@ -588,8 +583,8 @@ class Lifetime:
 
 def advance_lifetimes(
     lifetimes: Mapping[int, Lifetime],
-    source: ClusteringSnapshot,
-    target: ClusteringSnapshot,
+    source: Clustering,
+    target: Clustering,
     external: Iterable[ExternalTransition],
     internal: Iterable[InternalTransition],
 ) -> dict[int, Lifetime]:
@@ -611,8 +606,8 @@ def advance_lifetimes(
 
     Call it with an empty ``source`` to start a history:
 
-    >>> nothing = ClusteringSnapshot(0, {}, {})
-    >>> first = ClusteringSnapshot(1, {0: {1, 2}}, {1: 1.0, 2: 1.0})
+    >>> nothing = Clustering(0, {}, {})
+    >>> first = Clustering(1, {0: {1, 2}}, {1: 1.0, 2: 1.0})
     >>> external = detect_external_transitions(nothing, first)
     >>> advance_lifetimes({}, nothing, first, external, ())
     {0: Lifetime(strict=1, internal=1, absorption=1)}
@@ -686,8 +681,8 @@ def passforward_ratios(external: Iterable[ExternalTransition]) -> PassforwardRat
     Table 3 of the paper is headed "passforward ratios" but reports absolute
     numbers of clusters, so the values returned here do not match it directly.
 
-    >>> source = ClusteringSnapshot(0, {0: {1, 2}, 1: {3, 4}}, dict.fromkeys(range(1, 5), 1.0))
-    >>> target = ClusteringSnapshot(1, {7: {1, 2}}, {1: 1.0, 2: 1.0})
+    >>> source = Clustering(0, {0: {1, 2}, 1: {3, 4}}, dict.fromkeys(range(1, 5), 1.0))
+    >>> target = Clustering(1, {7: {1, 2}}, {1: 1.0, 2: 1.0})
     >>> passforward_ratios(detect_external_transitions(source, target))
     PassforwardRatios(survival=0.5, absorption=0.0)
 
@@ -737,14 +732,14 @@ class TransitionReport:
 class MONIC:
     """Monitor the transitions of clusters over a sequence of clusterings.
 
-    Give it one :py:class:`ClusteringSnapshot` per timepoint. Each is compared
+    Give it one :py:class:`Clustering` per timepoint. Each is compared
     with the one before it.
 
     >>> monic = MONIC()
-    >>> report = monic.update(ClusteringSnapshot(0, {0: {1, 2}, 1: {3, 4}}, dict.fromkeys(range(1, 5), 1.0)))
+    >>> report = monic.update(Clustering(0, {0: {1, 2}, 1: {3, 4}}, dict.fromkeys(range(1, 5), 1.0)))
     >>> [transition.kind.name for transition in report.external]
     ['EMERGED', 'EMERGED']
-    >>> report = monic.update(ClusteringSnapshot(1, {7: {1, 2, 5}}, {1: 1.0, 2: 1.0, 5: 1.0}))
+    >>> report = monic.update(Clustering(1, {7: {1, 2, 5}}, {1: 1.0, 2: 1.0, 5: 1.0}))
     >>> [(t.kind.name, t.source, t.targets) for t in report.external]
     [('SURVIVED', 0, (7,)), ('DISAPPEARED', 1, ())]
     >>> report.lifetimes[7].internal
@@ -794,43 +789,43 @@ class MONIC:
         self.delta = delta
         self.tau_mean = tau_mean
         self.tau_skew = tau_skew
-        self._snapshot: ClusteringSnapshot | None = None
+        self._clustering: Clustering | None = None
         self._lifetimes: dict[int, Lifetime] = {}
 
     @property
-    def snapshot(self) -> ClusteringSnapshot | None:
+    def clustering(self) -> Clustering | None:
         """The latest clustering, or ``None`` before the first update."""
-        return self._snapshot
+        return self._clustering
 
     @property
     def lifetimes(self) -> dict[int, Lifetime]:
         """The lifetime of every cluster of the latest clustering."""
         return dict(self._lifetimes)
 
-    def update(self, snapshot: ClusteringSnapshot) -> TransitionReport:
+    def update(self, clustering: Clustering) -> TransitionReport:
         """Compare a new clustering with the previous one.
 
-        :param snapshot: The clustering at the next timepoint.
+        :param clustering: The clustering at the next timepoint.
         :raises ValueError: If its timepoint is not later than the previous one.
         :return: The transitions from the previous clustering to this one. For
             the first clustering, every cluster has emerged.
         """
-        source = self._snapshot
+        source = self._clustering
         if source is None:
             source_timepoint = None
-            source = ClusteringSnapshot(snapshot.timepoint, {}, {})
-        elif snapshot.timepoint <= source.timepoint:
+            source = Clustering(clustering.timepoint, {}, {})
+        elif clustering.timepoint <= source.timepoint:
             raise ValueError(
-                f"Timepoint {snapshot.timepoint} is not later than the previous "
+                f"Timepoint {clustering.timepoint} is not later than the previous "
                 f"timepoint {source.timepoint}."
             )
         else:
             source_timepoint = source.timepoint
 
-        external = _external_transitions(source, snapshot, self.tau, self.tau_split)
+        external = _external_transitions(source, clustering, self.tau, self.tau_split)
         internal = detect_internal_transitions(
             source,
-            snapshot,
+            clustering,
             external,
             self.epsilon,
             self.delta,
@@ -838,25 +833,25 @@ class MONIC:
             self.tau_skew,
         )
         self._lifetimes = advance_lifetimes(
-            self._lifetimes, source, snapshot, external, internal
+            self._lifetimes, source, clustering, external, internal
         )
-        self._snapshot = snapshot
+        self._clustering = clustering
         report = TransitionReport(
             source_timepoint=source_timepoint,
-            target_timepoint=snapshot.timepoint,
-            overlap=build_overlap_matrix(source, snapshot),
+            target_timepoint=clustering.timepoint,
+            overlap=build_overlap_matrix(source, clustering),
             external=external,
             internal=internal,
             lifetimes=dict(self._lifetimes),
             ratios=passforward_ratios(external),
         )
         if self.debug:
-            _check_invariants(source, snapshot, report)
+            _check_invariants(source, clustering, report)
         return report
 
 
 def _check_invariants(
-    source: ClusteringSnapshot, target: ClusteringSnapshot, report: TransitionReport
+    source: Clustering, target: Clustering, report: TransitionReport
 ) -> None:
     """Raise an ``AssertionError`` if a report violates an invariant of MONIC.
 
@@ -921,282 +916,63 @@ def _check_invariants(
             )
 
 
-class AgeingFunction(ABC):
-    """The data ageing function of Definition 2.
+class MonitorableClusterer(ABC):
+    """A clusterer that can say which records are in which of its clusters.
 
-    It gives a record a weight that depends only on how long ago it arrived.
+    MONIC compares two clusterings record by record (Definition 3), so it needs
+    the members of every cluster, not only its centre. A clusterer that
+    implements this interface can be monitored by :py:class:`MONICMonitor`:
+
+    .. code-block:: python
+
+        class MyClusterer(Clusterer, MonitorableClusterer):
+            ...
+
+            def get_clustering(self) -> Clustering:
+                return Clustering(
+                    timepoint=self.instances_seen,
+                    clusters=...,  # cluster id -> ids of its records
+                    weights=...,  # record id -> ageing weight in [0, 1]
+                    points=...,  # record id -> feature vector
+                )
     """
 
     @abstractmethod
-    def weight(self, elapsed: np.ndarray) -> np.ndarray:
-        """Weights of records by the time since they arrived.
+    def get_clustering(self) -> Clustering:
+        """The clustering of the current state of the model.
 
-        :param elapsed: Non-negative numbers of timepoints.
-        :return: Weights in ``[0, 1]`` that do not increase with ``elapsed``.
+        For the transitions between two calls to be meaningful:
+
+        * A record keeps its id from one call to the next.
+        * The weights cover every record the model still holds, including
+          those in no cluster, and are their ageing weights now (Definition 2).
+          A record that is left out has aged out.
+        * The timepoint is later than that of the previous call.
+
+        The points are optional. Without them no internal transitions are
+        reported.
+
+        :return: The clusters of the model now, with their records.
         """
-
-
-class SlidingWindow(AgeingFunction):
-    """Records weigh 1 for ``size`` timepoints and 0 afterwards.
-
-    >>> SlidingWindow(2).weight(np.array([0, 1, 2, 3])).tolist()
-    [1.0, 1.0, 0.0, 0.0]
-    """
-
-    def __init__(self, size: float) -> None:
-        """Construct a sliding window.
-
-        :param size: The number of timepoints a record stays alive, counting
-            the one at which it arrives.
-        """
-        if size <= 0:
-            raise ValueError("The window size must be positive.")
-        self.size = size
-
-    def weight(self, elapsed: np.ndarray) -> np.ndarray:
-        return np.where(np.asarray(elapsed) < self.size, 1.0, 0.0)
-
-
-class ExponentialDecay(AgeingFunction):
-    """Records lose weight exponentially: ``2 ** (-rate * elapsed)``.
-
-    >>> ExponentialDecay(rate=1.0, min_weight=0.2).weight(np.array([0, 1, 2, 3])).tolist()
-    [1.0, 0.5, 0.25, 0.0]
-    """
-
-    def __init__(self, rate: float, min_weight: float = 1e-3) -> None:
-        """Construct an exponential decay.
-
-        :param rate: The decay rate. A record loses half its weight every
-            ``1 / rate`` timepoints.
-        :param min_weight: A weight below this is 0, so that old records can
-            be forgotten and memory stays bounded.
-        """
-        if rate <= 0:
-            raise ValueError("The decay rate must be positive.")
-        if not 0.0 < min_weight <= 1.0:
-            raise ValueError("The minimum weight must be in (0, 1].")
-        self.rate = rate
-        self.min_weight = min_weight
-
-    def weight(self, elapsed: np.ndarray) -> np.ndarray:
-        weight = 2.0 ** (-self.rate * np.asarray(elapsed, dtype=float))
-        return np.where(weight < self.min_weight, 0.0, weight)
-
-
-class RecordBuffer:
-    """The records still alive under an ageing function.
-
-    A record gets an id from a counter of the records added so far, and ages in
-    timepoints. Call :py:meth:`advance` to move on to the next timepoint.
-
-    >>> buffer = RecordBuffer(SlidingWindow(1))
-    >>> buffer.add([0.0, 1.0])
-    0
-    >>> buffer.advance()
-    >>> buffer.add([2.0, 3.0])
-    1
-    >>> record_ids, points, weights = buffer.records()
-    >>> record_ids.tolist(), points.tolist(), weights.tolist()
-    ([1], [[2.0, 3.0]], [1.0])
-    """
-
-    def __init__(self, ageing: AgeingFunction) -> None:
-        """Construct an empty buffer at timepoint 0.
-
-        :param ageing: Decides the weight of a record from its age.
-        """
-        self.ageing = ageing
-        self._timepoint = 0
-        self._n_added = 0
-        # Each entry is (record id, timepoint of arrival, point), oldest first.
-        self._records: deque[tuple[int, int, np.ndarray]] = deque()
-
-    @property
-    def timepoint(self) -> int:
-        """The current timepoint, which new records are stamped with."""
-        return self._timepoint
-
-    def add(self, point: Sequence[float]) -> int:
-        """Add a record that arrives at the current timepoint.
-
-        :param point: The feature vector of the record. It is copied.
-        :return: The id of the record: the number of records added before it.
-        """
-        record_id = self._n_added
-        self._n_added += 1
-        self._records.append((record_id, self._timepoint, np.array(point, dtype=float)))
-        return record_id
-
-    def advance(self) -> None:
-        """Move on to the next timepoint, ageing every record by one."""
-        self._timepoint += 1
-
-    def records(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """The records alive at the current timepoint.
-
-        Records that have reached weight 0 are forgotten for good.
-
-        :return: The ids, the points (one per row) and the weights of the
-            records, oldest first.
-        """
-        while self._records and self._weight_of(self._records[0][1]) == 0.0:
-            self._records.popleft()
-
-        record_ids = np.array([record[0] for record in self._records], dtype=int)
-        arrivals = np.array([record[1] for record in self._records])
-        points = np.array([record[2] for record in self._records])
-        return record_ids, points, self.ageing.weight(self._timepoint - arrivals)
-
-    def _weight_of(self, arrival: int) -> float:
-        return float(self.ageing.weight(np.array([self._timepoint - arrival]))[0])
-
-
-def snapshot_from_clusterer(
-    clusterer: Clusterer,
-    buffer: RecordBuffer,
-    level: Literal["auto", "macro", "micro"] = "auto",
-    max_distance: float | None = None,
-) -> ClusteringSnapshot:
-    """Turn the current state of a clusterer into a clustering with membership.
-
-    CapyMOA clusterers expose cluster centres but not which records belong to
-    which cluster. Membership is reconstructed: each record alive in ``buffer``
-    is assigned to the cluster whose centre is nearest in Euclidean distance,
-    the earlier cluster winning a tie. Cluster ids are positions in the
-    clusterer's list of centres. A cluster that receives no record is left out.
-
-    **Noise.** No cluster is ever created for records that fit nowhere. A record
-    farther than ``max_distance`` from every centre is noise: it belongs to no
-    cluster but stays alive, so it still counts against the overlap of the
-    cluster it used to be in. If ``max_distance`` is ``None`` there is no noise,
-    and every record joins its nearest cluster however far away it is. The
-    records left behind by a cluster that has died out are then handed to its
-    nearest neighbour, which is reported as having absorbed it. Set
-    ``max_distance`` to tell the two apart.
-
-    The radii reported by the clusterers are not used to detect noise, because
-    they are not comparable between clusterers: several report a radius of 0.
-
-    :param clusterer: A trained clusterer. Only its centres are read.
-    :param buffer: The records to assign. Its timepoint becomes the timepoint
-        of the snapshot.
-    :param level: Whether to use the macro-clusters or the micro-clusters of
-        the clusterer. ``"auto"`` uses the macro-clusters if the clusterer has
-        them.
-    :param max_distance: The largest distance from a record to the centre of
-        its cluster, or ``None`` for no limit.
-    :raises ValueError: If the clusterer does not implement ``level``, or its
-        centres do not have as many features as the records.
-    :return: The clustering at the timepoint of ``buffer``. It has no clusters
-        if the clusterer has none yet.
-    """
-    if level == "auto":
-        level = "macro" if clusterer.implements_macro_clusters() else "micro"
-    if level == "macro" and clusterer.implements_macro_clusters():
-        result = clusterer.get_clustering_result()
-    elif level == "micro" and clusterer.implements_micro_clusters():
-        result = clusterer.get_micro_clustering_result()
-    else:
-        raise ValueError(f"{clusterer} does not implement {level}-clusters.")
-
-    record_ids, points, weights = buffer.records()
-    record_ids = record_ids.tolist()
-    centres = np.asarray(result.get_centers(), dtype=float)
-
-    clusters: dict[int, set[int]] = {}
-    if len(record_ids) > 0 and len(centres) > 0:
-        if centres.ndim != 2 or centres.shape[1] != points.shape[1]:
-            raise ValueError(
-                f"The centres of {clusterer} have shape {centres.shape}, but the "
-                f"records have {points.shape[1]} features."
-            )
-        squared_distances = (
-            (points**2).sum(axis=1)[:, np.newaxis]
-            - 2.0 * points @ centres.T
-            + (centres**2).sum(axis=1)[np.newaxis, :]
-        ).clip(min=0.0)
-        nearest = squared_distances.argmin(axis=1)
-        assigned = np.ones(len(record_ids), dtype=bool)
-        if max_distance is not None:
-            assigned = squared_distances.min(axis=1) <= max_distance**2
-        for record_id, cluster_id in zip(
-            np.asarray(record_ids)[assigned].tolist(), nearest[assigned].tolist()
-        ):
-            clusters.setdefault(cluster_id, set()).add(record_id)
-
-    return ClusteringSnapshot(
-        timepoint=buffer.timepoint,
-        clusters=dict(sorted(clusters.items())),
-        weights=dict(zip(record_ids, weights.tolist())),
-        points=dict(zip(record_ids, points)),
-    )
 
 
 class MONICMonitor:
-    """Monitor the cluster transitions of a CapyMOA clusterer on a stream.
+    """Monitor the cluster transitions of a clusterer on a stream.
 
-    Every ``snapshot_interval`` instances is a timepoint. At each timepoint the
-    clusterer's current clusters are turned into a clustering of the recent
-    instances (see :py:func:`snapshot_from_clusterer`), which is compared with
-    the clustering of the previous timepoint (see :py:class:`MONIC`).
+    Every ``check_interval`` instances is a timepoint. At each timepoint the
+    monitor asks the clusterer for its current clustering (see
+    :py:class:`MonitorableClusterer`) and compares it with the clustering of the
+    previous timepoint (see :py:class:`MONIC`).
 
-    **Re-clustering versus incremental clustering.** MONIC assumes that the
-    data is clustered afresh at each timepoint, so that a clustering is a
-    partition of the records alive at that timepoint. A CapyMOA clusterer is
-    incremental instead: it updates a summary of the stream, and never says
-    which record belongs to which cluster. The two are reconciled as follows.
-
-    * The monitor keeps its own buffer of recent instances, aged by ``ageing``.
-      At a timepoint, the clustering is the partition of that buffer obtained
-      by assigning each instance to the nearest of the clusterer's current
-      centres. Only the centres come from the clusterer; the membership is
-      reconstructed.
-    * An instance has an id, the number of instances seen before it, and keeps
-      it from one timepoint to the next. That is what makes the overlap of two
-      clusters of different timepoints well defined.
-
-    **What a transition means.** A transition describes how the clusterer's
-    model divides the recent instances now, compared with how it divided them
-    one timepoint ago. It therefore reflects both a change in the data and a
-    change in the model, and the two cannot be told apart from the report:
-
-    * A clusterer that keeps a cluster alive after its data has stopped will
-      delay or hide its disappearance. A clusterer that moves a centre slowly
-      will delay a split. Transitions are seen when the model reacts, not when
-      the data changes.
-    * A clusterer whose clusters are not stable between calls produces
-      transitions without any change in the data. This applies to
-      macro-clusters that are recomputed on every request, and to
-      micro-clusters, of which there are usually hundreds.
-    * The clusterer forgets old data on its own schedule, and the monitor on
-      that of ``ageing``. The two are not synchronised. If the clusterer
-      remembers for much longer than the monitor, its centres describe data
-      that the monitor no longer holds.
-    * The members of a cluster are the instances nearest to its centre, which
-      is not necessarily how the clusterer itself would have assigned them.
-
-    **Noise.** See :py:func:`snapshot_from_clusterer`. With the default
-    ``max_distance=None``, a cluster that dies out is reported as absorbed by
-    its nearest neighbour instead of as disappeared.
-
-    >>> from capymoa.cluster import Clustream_with_kmeans
-    >>> from capymoa.stream.generator import RandomRBFGenerator
-    >>> stream = RandomRBFGenerator()
-    >>> clusterer = Clustream_with_kmeans(schema=stream.get_schema(), k_option=5)
-    >>> monitor = MONICMonitor(clusterer, snapshot_interval=500)
-    >>> reports = list(monitor.monitor(stream, max_instances=2000))
-    >>> [report.target_timepoint for report in reports]
-    [0, 1, 2, 3]
+    A transition describes how the clusterer's model changed between two
+    timepoints. It reflects a change in the data only once the model has
+    reacted to it.
     """
 
     def __init__(
         self,
         clusterer: Clusterer,
-        snapshot_interval: int = 1000,
-        ageing: AgeingFunction | None = None,
-        level: Literal["auto", "macro", "micro"] = "auto",
-        max_distance: float | None = None,
+        check_interval: int = 1000,
         tau: float = 0.5,
         tau_split: float = 0.1,
         epsilon: float = 0.1,
@@ -1207,14 +983,9 @@ class MONICMonitor:
     ) -> None:
         """Construct a monitor.
 
-        :param clusterer: The clusterer to train and monitor.
-        :param snapshot_interval: The number of instances between timepoints.
-        :param ageing: How instances lose weight from one timepoint to the
-            next. Defaults to ``SlidingWindow(2)``, the setting of the paper:
-            an instance is alive at the timepoint after it arrives and at the
-            one after that.
-        :param level: See :py:func:`snapshot_from_clusterer`.
-        :param max_distance: See :py:func:`snapshot_from_clusterer`.
+        :param clusterer: The clusterer to train and monitor. It must implement
+            :py:class:`MonitorableClusterer`.
+        :param check_interval: The number of instances between timepoints.
         :param tau: See :py:func:`detect_external_transitions`.
         :param tau_split: See :py:func:`detect_external_transitions`.
         :param epsilon: See :py:func:`detect_internal_transitions`.
@@ -1223,43 +994,36 @@ class MONICMonitor:
         :param tau_skew: See :py:func:`detect_internal_transitions`.
         :param debug: Check the invariants of MONIC at every timepoint. See
             :py:class:`MONIC`.
+        :raises TypeError: If the clusterer does not implement
+            :py:class:`MonitorableClusterer`.
         """
-        if snapshot_interval < 1:
-            raise ValueError("The snapshot interval must be at least 1.")
-        if max_distance is not None and max_distance < 0:
-            raise ValueError("The maximum distance must be non-negative.")
+        if not isinstance(clusterer, MonitorableClusterer):
+            raise TypeError(f"{clusterer} does not implement MonitorableClusterer.")
+        if check_interval < 1:
+            raise ValueError("The check interval must be at least 1.")
         self.clusterer = clusterer
-        self.snapshot_interval = snapshot_interval
-        self.level = level
-        self.max_distance = max_distance
+        self.check_interval = check_interval
         self.monic = MONIC(
             tau, tau_split, epsilon, delta, tau_mean, tau_skew, debug=debug
         )
-        self.buffer = RecordBuffer(SlidingWindow(2) if ageing is None else ageing)
         self.instances_seen = 0
 
     @property
-    def snapshot(self) -> ClusteringSnapshot | None:
+    def clustering(self) -> Clustering | None:
         """The latest clustering, or ``None`` before the first timepoint."""
-        return self.monic.snapshot
+        return self.monic.clustering
 
     def train(self, instance: Instance) -> TransitionReport | None:
-        """Train the clusterer on an instance and record it.
+        """Train the clusterer on an instance.
 
         :param instance: The next instance of the stream.
         :return: A report if the instance completes a timepoint, else ``None``.
         """
         self.clusterer.train(instance)
-        self.buffer.add(instance.x)
         self.instances_seen += 1
-        if self.instances_seen % self.snapshot_interval != 0:
+        if self.instances_seen % self.check_interval != 0:
             return None
-
-        snapshot = snapshot_from_clusterer(
-            self.clusterer, self.buffer, self.level, self.max_distance
-        )
-        self.buffer.advance()
-        return self.monic.update(snapshot)
+        return self.monic.update(self.clusterer.get_clustering())
 
     def monitor(
         self, stream: Stream, max_instances: int | None = None
