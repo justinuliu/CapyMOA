@@ -34,7 +34,7 @@
 #
 # *More information about CapyMOA can be found at* https://www.capymoa.org.
 #
-# **last update on 15/10/2026**
+# **last update on 16/10/2026**
 
 # %% [markdown]
 # ## A stream with known transitions
@@ -119,7 +119,7 @@ def drifting_stream(seed: int = 1) -> NumpyStream:
 # so this tutorial writes a small clusterer of its own.
 #
 # - It keeps the instances of the last two timepoints, each with weight 1, like the
-#   sliding window of size 2 in the paper. An instance's id is `instance._id`, which
+#   sliding window of size 2 in the paper. An instance's id is `instance.id`, which
 #   CapyMOA gives every instance when it is created.
 # - Its clusters come from the most recent timepoint only. Each instance joins the
 #   nearest centre within `radius`, moving it to the mean of its members, or else
@@ -159,7 +159,7 @@ class WindowedLeader(Clusterer, MonitorableClusterer):
         return "WindowedLeader"
 
     def train(self, instance: Instance) -> None:
-        self.window.append((instance._id, instance.x.copy()))
+        self.window.append((instance.id, instance.x.copy()))
         self.instances_seen += 1
 
     def _leaders(self) -> tuple[list[np.ndarray], list[int]]:

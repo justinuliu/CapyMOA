@@ -4,7 +4,8 @@ CapyMOA never constructs a ``SparseInstance`` itself, but a MOA stream can hand 
 back (e.g. an ARFF file using sparse row syntax, see ``test_stream.py``). These tests
 construct matching ``DenseInstance``/``SparseInstance`` objects directly and confirm
 ``Instance``/``LabeledInstance``/``RegressionInstance`` extract the same values from
-both, since CapyMOA passes the underlying MOA instance through unchanged.
+both, since CapyMOA passes the underlying MOA instance through unchanged. A last test
+checks that every instance gets its own id.
 """
 
 import numpy as np
@@ -81,3 +82,23 @@ def test_dense_and_sparse_instance_agree_regression():
         )
         assert np.allclose(instance.x, F_VALUES)
         assert instance.y_value == class_value
+
+
+def test_every_instance_has_its_own_id():
+    schema = Schema.from_custom(
+        features=["f1", "f2", "f3", "class"],
+        target="class",
+        categories={"class": ["yes", "no"]},
+        name="instance-id-test",
+    )
+    raw_instance = InstanceExample(_dense_instance(schema.get_moa_header(), 0.0))
+
+    # Wrapping the same Java instance twice gives two ids.
+    instances = [
+        LabeledInstance.from_java_instance(schema, raw_instance),
+        LabeledInstance.from_java_instance(schema, raw_instance),
+        LabeledInstance.from_array(schema, np.array(F_VALUES), 0),
+    ]
+
+    ids = [instance.id for instance in instances]
+    assert ids == sorted(set(ids))

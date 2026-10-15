@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from itertools import count
 from typing import TYPE_CHECKING, TypeVar
 
 import numpy as np
@@ -7,7 +8,6 @@ from jpype import JArray, JDouble
 from moa.core import InstanceExample
 from numpy import double
 from numpy.typing import NDArray
-from itertools import count
 
 # Schema is only imported for type hinting. If we were to import Schema directly
 # in this file, it would create a circular import.
@@ -73,7 +73,7 @@ class Instance:
     a class label or target value respectively.
     """
 
-    id_counter = count(start=0)
+    _id_counter = count(start=0)
 
     def __init__(
         self, schema: "Schema", instance: InstanceExample | FeatureVector
@@ -99,7 +99,7 @@ class Instance:
         else:
             raise TypeError(f"Given instance type unsupported: {type(instance)}")
 
-        self._id = next(Instance.id_counter)
+        self._id = next(Instance._id_counter)
 
     @classmethod
     def from_java_instance(
@@ -204,6 +204,26 @@ class Instance:
     def schema(self) -> "Schema":
         """Returns the schema of the instance and the stream it belongs to."""
         return self._schema
+
+    @property
+    def id(self) -> int:
+        """Returns an id that no other instance created in this process shares.
+
+        Every instance takes the next value of one counter when it is created,
+        whatever stream it comes from. The ids of a stream are therefore not
+        necessarily consecutive, and change if the stream is read again. Ids are
+        not unique across processes.
+
+        >>> from capymoa.stream import Schema
+        >>> from capymoa.core import Instance
+        >>> import numpy as np
+        >>> schema = Schema.from_custom(["f1", "f2", "target"], "target")
+        >>> first = Instance.from_array(schema, np.array([0.1, 0.2]))
+        >>> second = Instance.from_array(schema, np.array([0.1, 0.2]))
+        >>> first.id < second.id
+        True
+        """
+        return self._id
 
     @property
     def x(self) -> FeatureVector:

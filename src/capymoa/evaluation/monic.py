@@ -84,10 +84,14 @@ class Clustering:
     weights: Mapping[int, float]
     """Maps a record id to its ageing weight ``age(record, timepoint)`` in
     ``[0, 1]``. It covers every record alive at this timepoint, including
-    records that belong to no cluster. A record that is absent has weight 0."""
+    records that belong to no cluster. A record that is absent has weight 0.
+    A record of weight 0 has aged out even if it is in a cluster: it adds
+    nothing to any overlap and has no weight in the statistics of its cluster."""
     points: Mapping[int, Sequence[float]] | None = field(default=None, compare=False)
     """Maps a record id to its feature vector at this timepoint. Only internal
-    transitions need it."""
+    transitions need it. If either of two clusterings has no points, the
+    internal analysis of every survived cluster between them is skipped, so its
+    strict lifetime restarts at 1 (see :py:func:`advance_lifetimes`)."""
 
     def __post_init__(self) -> None:
         clusters = {
@@ -946,11 +950,13 @@ class MonitorableClusterer(ABC):
         * A record keeps its id from one call to the next.
         * The weights cover every record the model still holds, including
           those in no cluster, and are their ageing weights now (Definition 2).
-          A record that is left out has aged out.
+          A record that is left out, or has weight 0, has aged out, even if it
+          is in a cluster.
         * The timepoint is later than that of the previous call.
 
-        The points are optional. Without them no internal transitions are
-        reported.
+        The points are optional. Without them the internal analysis of every
+        survived cluster is skipped: no internal transitions are reported, and
+        the strict lifetime of every cluster stays at 1.
 
         :return: The clusters of the model now, with their records.
         """
@@ -996,6 +1002,8 @@ class MONICMonitor:
             :py:class:`MONIC`.
         :raises TypeError: If the clusterer does not implement
             :py:class:`MonitorableClusterer`.
+        :raises ValueError: If ``check_interval`` is less than 1, or a threshold
+            is out of range. See :py:class:`MONIC`.
         """
         if not isinstance(clusterer, MonitorableClusterer):
             raise TypeError(f"{clusterer} does not implement MonitorableClusterer.")
