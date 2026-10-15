@@ -179,17 +179,17 @@ class WindowedLeader(Clusterer, MonitorableClusterer):
         return [centres[i] for i in kept], [sizes[i] for i in kept]
 
     def get_clustering(self) -> Clustering:
-        ids = [record for record, _ in self.window]
+        ids = [instance_id for instance_id, _ in self.window]
         points = np.array([x for _, x in self.window])
         centres = np.array(self._leaders()[0])
         clusters: dict[int, set[int]] = {}
         if len(ids) > 0 and len(centres) > 0:
             distances = np.linalg.norm(points[:, np.newaxis] - centres, axis=2)
-            for record, nearest, distance in zip(
+            for instance_id, nearest, distance in zip(
                 ids, distances.argmin(axis=1), distances.min(axis=1)
             ):
                 if distance <= self.max_distance:
-                    clusters.setdefault(int(nearest), set()).add(record)
+                    clusters.setdefault(int(nearest), set()).add(instance_id)
         return Clustering(
             timepoint=self.instances_seen,
             clusters=clusters,
@@ -244,7 +244,7 @@ class WindowedLeader(Clusterer, MonitorableClusterer):
 # and raises an `AssertionError` if one is violated.
 
 # %%
-from capymoa.evaluation.monic import ExternalKind, MONICMonitor
+from capymoa.evaluation.monic import MONICMonitor
 
 stream = drifting_stream()
 clusterer = WindowedLeader(stream.get_schema())
@@ -259,7 +259,9 @@ monitor = MONICMonitor(
 
 def where(clustering: Clustering, cluster_id: int) -> str:
     """Describe a cluster by where it is, since its id means nothing over time."""
-    points = [clustering.points[record] for record in clustering.clusters[cluster_id]]
+    points = [
+        clustering.points[instance] for instance in clustering.clusters[cluster_id]
+    ]
     x, y = np.mean(points, axis=0).round().astype(int)
     return f"({x}, {y})"
 
@@ -376,13 +378,21 @@ print(overlaps_of(7, "(-12, 0)").to_string())
 # can be replayed with other thresholds.
 
 # %%
-from capymoa.evaluation.monic import MONIC
+from capymoa.evaluation.monic import MONIC, TransitionType
+
+EXTERNAL = [
+    TransitionType.SURVIVED,
+    TransitionType.ABSORBED,
+    TransitionType.SPLIT,
+    TransitionType.DISAPPEARED,
+    TransitionType.EMERGED,
+]
 
 
 def count_transitions(tau: float, tau_split: float) -> dict[str, float]:
-    """Count the transitions between timepoints for the given thresholds."""
+    """Count the external transitions between timepoints for the given thresholds."""
     monic = MONIC(tau=tau, tau_split=tau_split, debug=True)
-    counts = dict.fromkeys(ExternalKind, 0)
+    counts = dict.fromkeys(EXTERNAL, 0)
     for clustering in clusterings:
         report = monic.update(clustering)
         if report.source_timepoint is None:

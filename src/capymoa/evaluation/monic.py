@@ -38,15 +38,14 @@ from capymoa.stream import Stream
 __all__ = [
     "MONIC",
     "Clustering",
-    "ExternalKind",
     "ExternalTransition",
-    "InternalKind",
     "InternalTransition",
     "Lifetime",
     "MONICMonitor",
     "MonitorableClusterer",
     "PassforwardRatios",
     "TransitionReport",
+    "TransitionType",
     "advance_lifetimes",
     "build_overlap_matrix",
     "detect_external_transitions",
@@ -58,7 +57,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class Clustering:
-    """A clustering at one timepoint, with record-level membership.
+    """A clustering at one timepoint, with instance-level membership.
 
     The row and column order of an overlap matrix follows the iteration order of
     :py:attr:`clusters`.
@@ -71,41 +70,41 @@ class Clustering:
     >>> clustering.cluster_ids
     (0, 1)
 
-    :raises ValueError: If a record belongs to more than one cluster, a
-        clustered record has no weight or no point, a weight is outside
+    :raises ValueError: If an instance belongs to more than one cluster, a
+        clustered instance has no weight or no point, a weight is outside
         ``[0, 1]``, or the points do not all have the same number of features.
     """
 
     timepoint: float
     """The timepoint at which the clustering was built."""
     clusters: Mapping[int, AbstractSet[int]]
-    """Maps a cluster id to the ids of its records. Cluster ids are only
+    """Maps a cluster id to the ids of its instances. Cluster ids are only
     meaningful within this clustering. Clusters must be disjoint."""
     weights: Mapping[int, float]
-    """Maps a record id to its ageing weight ``age(record, timepoint)`` in
-    ``[0, 1]``. It covers every record alive at this timepoint, including
-    records that belong to no cluster. A record that is absent has weight 0.
-    A record of weight 0 has aged out even if it is in a cluster: it adds
+    """Maps an instance id to its ageing weight ``age(instance, timepoint)`` in
+    ``[0, 1]``. It covers every instance alive at this timepoint, including
+    instances that belong to no cluster. An instance that is absent has weight 0.
+    An instance of weight 0 has aged out even if it is in a cluster: it adds
     nothing to any overlap and has no weight in the statistics of its cluster."""
     points: Mapping[int, Sequence[float]] | None = field(default=None, compare=False)
-    """Maps a record id to its feature vector at this timepoint. Only internal
+    """Maps an instance id to its feature vector at this timepoint. Only internal
     transitions need it. If either of two clusterings has no points, the
     internal analysis of every survived cluster between them is skipped, so its
     strict lifetime restarts at 1 (see :py:func:`advance_lifetimes`)."""
 
     def __post_init__(self) -> None:
         clusters = {
-            cluster_id: frozenset(records)
-            for cluster_id, records in self.clusters.items()
+            cluster_id: frozenset(instances)
+            for cluster_id, instances in self.clusters.items()
         }
         weights = dict(self.weights)
 
-        n_memberships = sum(len(records) for records in clusters.values())
+        n_memberships = sum(len(instances) for instances in clusters.values())
         clustered: frozenset[int] = frozenset().union(*clusters.values())
         if len(clustered) != n_memberships:
             raise ValueError("Clusters must be disjoint.")
         if not clustered <= weights.keys():
-            raise ValueError("Every clustered record must have a weight.")
+            raise ValueError("Every clustered instance must have a weight.")
         if any(not 0.0 <= weight <= 1.0 for weight in weights.values()):
             raise ValueError("Weights must be in [0, 1].")
 
@@ -115,11 +114,11 @@ class Clustering:
         if self.points is None:
             return
         points = {
-            record: np.asarray(point, dtype=float)
-            for record, point in self.points.items()
+            instance: np.asarray(point, dtype=float)
+            for instance, point in self.points.items()
         }
         if not clustered <= points.keys():
-            raise ValueError("Every clustered record must have a point.")
+            raise ValueError("Every clustered instance must have a point.")
         if len({point.shape for point in points.values()}) > 1 or any(
             point.ndim != 1 for point in points.values()
         ):
@@ -139,11 +138,11 @@ class Clustering:
         return len(next(iter(self.points.values())))
 
     def without_clusters(self, cluster_ids: Iterable[int]) -> "Clustering":
-        """Turn the records of some clusters into noise.
+        """Turn the instances of some clusters into noise.
 
-        Use it on a garbage cluster: one into which a clusterer puts the records
+        Use it on a garbage cluster: one into which a clusterer puts the instances
         it cannot place. Such a cluster is large, so left in place it becomes
-        the match of clusters that merely scattered. Its records stay alive but
+        the match of clusters that merely scattered. Its instances stay alive but
         belong to no cluster, so they still count against the overlap of the
         clusters they came from.
 
@@ -156,8 +155,8 @@ class Clustering:
         """
         dropped = set(cluster_ids)
         clusters = {
-            cluster_id: records
-            for cluster_id, records in self.clusters.items()
+            cluster_id: instances
+            for cluster_id, instances in self.clusters.items()
             if cluster_id not in dropped
         }
         return Clustering(self.timepoint, clusters, self.weights, self.points)
@@ -168,31 +167,31 @@ def overlap(
 ) -> float:
     """Overlap of cluster ``x`` to cluster ``y`` (Definition 3).
 
-    The normalised sum of the weights of the records in the intersection:
+    The normalised sum of the weights of the instances in the intersection:
     ``sum(age(a, t_j) for a in x & y) / sum(age(a, t_j) for a in x)``. Both sums
     use the weights of the later timepoint ``t_j``. Overlap is not symmetric.
 
     >>> overlap({1, 2, 3, 4}, {3, 4, 5}, {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0})
     0.5
 
-    :param x: Record ids of a cluster found at the earlier timepoint ``t_i``.
-    :param y: Record ids of a cluster found at the later timepoint ``t_j``.
-    :param weights: Ageing weights at ``t_j``. An absent record has weight 0.
-    :return: The overlap in ``[0, 1]``, or 0 if every record of ``x`` has aged
+    :param x: Instance ids of a cluster found at the earlier timepoint ``t_i``.
+    :param y: Instance ids of a cluster found at the later timepoint ``t_j``.
+    :param weights: Ageing weights at ``t_j``. An absent instance has weight 0.
+    :return: The overlap in ``[0, 1]``, or 0 if every instance of ``x`` has aged
         out by ``t_j``.
     """
-    denominator = sum(weights.get(record, 0.0) for record in x)
+    denominator = sum(weights.get(instance, 0.0) for instance in x)
     if denominator == 0.0:
         return 0.0
-    return sum(weights.get(record, 0.0) for record in x & y) / denominator
+    return sum(weights.get(instance, 0.0) for instance in x & y) / denominator
 
 
 def build_overlap_matrix(source: Clustering, target: Clustering) -> np.ndarray:
     """Overlap of every cluster of ``source`` to every cluster of ``target``.
 
-    Uses an inverted index from record id to the cluster of ``target``, then a
-    single pass over the records of each cluster of ``source``. Besides
-    allocating the matrix, the cost is linear in the number of records rather
+    Uses an inverted index from instance id to the cluster of ``target``, then a
+    single pass over the instances of each cluster of ``source``. Besides
+    allocating the matrix, the cost is linear in the number of instances rather
     than in the number of cluster pairs.
 
     >>> source = Clustering(0, {0: {1, 2, 3, 4}}, dict.fromkeys(range(1, 5), 1.0))
@@ -206,7 +205,7 @@ def build_overlap_matrix(source: Clustering, target: Clustering) -> np.ndarray:
     :return: A matrix of shape ``(len(source.clusters), len(target.clusters))``
         where entry ``[i, j]`` is the overlap of the ``i``-th cluster of
         ``source`` to the ``j``-th cluster of ``target``. A row is all zeros if
-        every record of its cluster has aged out.
+        every instance of its cluster has aged out.
     """
     intersections, totals = _intersection_weights(source, target)
     return _divide_or_zero(intersections, totals[:, np.newaxis])
@@ -222,18 +221,18 @@ def _intersection_weights(
         ``source``.
     """
     column_of = {
-        record: column
-        for column, records in enumerate(target.clusters.values())
-        for record in records
+        instance: column
+        for column, instances in enumerate(target.clusters.values())
+        for instance in instances
     }
 
     intersections = np.zeros((len(source.clusters), len(target.clusters)))
     totals = np.zeros(len(source.clusters))
-    for row, records in enumerate(source.clusters.values()):
-        for record in records:
-            weight = target.weights.get(record, 0.0)
+    for row, instances in enumerate(source.clusters.values()):
+        for instance in instances:
+            weight = target.weights.get(instance, 0.0)
             totals[row] += weight
-            column = column_of.get(record)
+            column = column_of.get(instance)
             if column is not None:
                 intersections[row, column] += weight
     return intersections, totals
@@ -249,26 +248,49 @@ def _divide_or_zero(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarra
     )
 
 
-class ExternalKind(Enum):
-    """The external transitions of a cluster (Table 1)."""
+class TransitionType(Enum):
+    """The transitions of a cluster.
+
+    The external transitions (Table 1) say what became of a cluster: it
+    survived, was absorbed, was split or disappeared. A new cluster emerged.
+
+    The internal transitions (Table 2) say how a survived cluster changed. There
+    are three groups: size, compactness and location. A cluster undergoes at
+    most one transition of each group.
+    """
 
     SURVIVED = "survived"
-    """The cluster has a match that is the match of no other cluster."""
+    """External: the cluster has a match that is the match of no other cluster."""
     ABSORBED = "absorbed"
-    """The cluster has a match that is also the match of another cluster."""
+    """External: the cluster has a match that is also the match of another
+    cluster."""
     SPLIT = "split"
-    """The cluster has no match, but several clusters together form one."""
+    """External: the cluster has no match, but several clusters together form
+    one."""
     DISAPPEARED = "disappeared"
-    """None of the other cases hold for the cluster."""
+    """External: none of the other cases hold for the cluster."""
     EMERGED = "emerged"
-    """A new cluster that is not the result of another external transition."""
+    """External: a new cluster that is not the result of another external
+    transition."""
+    SHRUNK = "shrunk"
+    """Internal, size: the cluster lost weight."""
+    EXPANDED = "expanded"
+    """Internal, size: the cluster gained weight."""
+    COMPACTED = "compacted"
+    """Internal, compactness: the cluster became more compact."""
+    DIFFUSED = "diffused"
+    """Internal, compactness: the cluster became more diffuse."""
+    SHIFTED = "shifted"
+    """Internal, location: the mean or the skewness of the cluster moved."""
 
 
 @dataclass(frozen=True)
 class ExternalTransition:
     """An external transition between two clusterings."""
 
-    kind: ExternalKind
+    kind: TransitionType
+    """One of the external transitions: survived, absorbed, split, disappeared
+    or emerged."""
     source: int | None
     """The id of the cluster of the earlier clustering that underwent the
     transition, or ``None`` for an emerged cluster."""
@@ -339,8 +361,8 @@ def _external_transitions(
     forward = _divide_or_zero(intersections, totals[:, np.newaxis])
     target_totals = np.array(
         [
-            sum(target.weights[record] for record in records)
-            for records in target.clusters.values()
+            sum(target.weights[instance] for instance in instances)
+            for instances in target.clusters.values()
         ]
     )
     reverse = _divide_or_zero(intersections, target_totals[np.newaxis, :])
@@ -378,42 +400,23 @@ def _external_transitions(
         if row in match_of:
             column = match_of[row]
             absorbed = n_matched_by[column] > 1
-            kind = ExternalKind.ABSORBED if absorbed else ExternalKind.SURVIVED
+            kind = TransitionType.ABSORBED if absorbed else TransitionType.SURVIVED
             targets: tuple[int, ...] = (target_ids[column],)
         elif row in split_of:
-            kind = ExternalKind.SPLIT
+            kind = TransitionType.SPLIT
             targets = tuple(target_ids[column] for column in split_of[row])
         else:
-            kind = ExternalKind.DISAPPEARED
+            kind = TransitionType.DISAPPEARED
             targets = ()
         produced.update(targets)
         transitions.append(ExternalTransition(kind, source_id, targets))
 
     transitions.extend(
-        ExternalTransition(ExternalKind.EMERGED, None, (target_id,))
+        ExternalTransition(TransitionType.EMERGED, None, (target_id,))
         for target_id in target_ids
         if target_id not in produced
     )
     return tuple(transitions)
-
-
-class InternalKind(Enum):
-    """The internal transitions of a survived cluster (Table 2).
-
-    There are three groups: size, compactness and location. A cluster undergoes
-    at most one transition of each group.
-    """
-
-    SHRUNK = "shrunk"
-    """Size: the cluster lost weight."""
-    EXPANDED = "expanded"
-    """Size: the cluster gained weight."""
-    COMPACTED = "compacted"
-    """Compactness: the cluster became more compact."""
-    DIFFUSED = "diffused"
-    """Compactness: the cluster became more diffuse."""
-    SHIFTED = "shifted"
-    """Location: the mean or the skewness of the cluster moved."""
 
 
 @dataclass(frozen=True)
@@ -424,9 +427,10 @@ class InternalTransition:
     """The id of the cluster in the earlier clustering."""
     target: int
     """The id of the cluster in the later clustering."""
-    kinds: frozenset[InternalKind]
-    """The transitions the cluster underwent. Empty if it did not change, and
-    also if the analysis was :py:attr:`skipped`."""
+    kinds: frozenset[TransitionType]
+    """The internal transitions the cluster underwent: at most one of shrunk
+    and expanded, one of compacted and diffused, and shifted. Empty if it did
+    not change, and also if the analysis was :py:attr:`skipped`."""
     skipped: bool = False
     """``True`` if the cluster could not be analysed, because the two
     clusterings do not both carry points with the same number of features or
@@ -444,16 +448,16 @@ def _statistics(clustering: Clustering, cluster_id: int) -> _Statistics | None:
     """Weighted statistics of a cluster, using the weights of its own clustering.
 
     :return: The weight of the cluster, its mean, the root mean square distance
-        of its records to the mean and its skewness in each feature, or ``None``
+        of its instances to the mean and its skewness in each feature, or ``None``
         if the cluster has no weight.
     """
-    records = sorted(clustering.clusters[cluster_id])
-    weights = np.array([clustering.weights[record] for record in records])
+    instances = sorted(clustering.clusters[cluster_id])
+    weights = np.array([clustering.weights[instance] for instance in instances])
     total = weights.sum()
     if total == 0.0:
         return None
 
-    points = np.array([clustering.points[record] for record in records])
+    points = np.array([clustering.points[instance] for instance in instances])
     mean = weights @ points / total
     centred = points - mean
     variance = weights @ centred**2 / total
@@ -489,7 +493,7 @@ def detect_internal_transitions(
     """Detect the internal transitions of the survived clusters (Table 2).
 
     A cluster is described by its weight, its mean, its spread ``sigma`` (the
-    root mean square distance of its records to the mean) and its skewness in
+    root mean square distance of its instances to the mean) and its skewness in
     each feature. Each cluster is weighted by its own clustering. Unlike in the
     paper, the thresholds on weight, spread and mean are relative, so that they
     do not depend on the size of the stream or the scale of the features.
@@ -532,7 +536,7 @@ def detect_internal_transitions(
 
     result = []
     for transition in transitions:
-        if transition.kind is not ExternalKind.SURVIVED:
+        if transition.kind is not TransitionType.SURVIVED:
             continue
         source_id = transition.source
         (target_id,) = transition.targets
@@ -546,19 +550,19 @@ def detect_internal_transitions(
 
         kinds = set()
         if after.weight < (1 - epsilon) * before.weight:
-            kinds.add(InternalKind.SHRUNK)
+            kinds.add(TransitionType.SHRUNK)
         elif after.weight > (1 + epsilon) * before.weight:
-            kinds.add(InternalKind.EXPANDED)
+            kinds.add(TransitionType.EXPANDED)
 
         if after.spread < (1 - delta) * before.spread:
-            kinds.add(InternalKind.COMPACTED)
+            kinds.add(TransitionType.COMPACTED)
         elif after.spread > (1 + delta) * before.spread:
-            kinds.add(InternalKind.DIFFUSED)
+            kinds.add(TransitionType.DIFFUSED)
 
         mean_shift = np.linalg.norm(after.mean - before.mean)
         skew_shift = np.abs(after.skewness - before.skewness).max()
         if mean_shift > tau_mean * before.spread or skew_shift > tau_skew:
-            kinds.add(InternalKind.SHIFTED)
+            kinds.add(TransitionType.SHIFTED)
 
         result.append(InternalTransition(source_id, target_id, frozenset(kinds)))
     return tuple(result)
@@ -637,14 +641,14 @@ def advance_lifetimes(
     continued: dict[int, Lifetime] = {}
     absorbed_by: dict[int, list[int]] = {}
     for transition in external:
-        if transition.kind is ExternalKind.SURVIVED:
+        if transition.kind is TransitionType.SURVIVED:
             before = lifetimes[transition.source]
             continued[transition.targets[0]] = Lifetime(
                 strict=before.strict + 1 if transition.source in unchanged else 1,
                 internal=before.internal + 1,
                 absorption=before.absorption + 1,
             )
-        elif transition.kind is ExternalKind.ABSORBED:
+        elif transition.kind is TransitionType.ABSORBED:
             absorbed_by.setdefault(transition.targets[0], []).append(transition.source)
 
     for target_id, source_ids in absorbed_by.items():
@@ -696,14 +700,14 @@ def passforward_ratios(external: Iterable[ExternalTransition]) -> PassforwardRat
     kinds = Counter(
         transition.kind
         for transition in external
-        if transition.kind is not ExternalKind.EMERGED
+        if transition.kind is not TransitionType.EMERGED
     )
     n_clusters = sum(kinds.values())
     if n_clusters == 0:
         return PassforwardRatios(0.0, 0.0)
     return PassforwardRatios(
-        survival=kinds[ExternalKind.SURVIVED] / n_clusters,
-        absorption=kinds[ExternalKind.ABSORBED] / n_clusters,
+        survival=kinds[TransitionType.SURVIVED] / n_clusters,
+        absorption=kinds[TransitionType.ABSORBED] / n_clusters,
     )
 
 
@@ -728,7 +732,7 @@ class TransitionReport:
     ratios: PassforwardRatios
     """The survival and absorption ratios of the earlier clustering."""
     overlap_weighting: str = "target"
-    """Overlap weights every record by its weight at the later timepoint."""
+    """Overlap weights every instance by its weight at the later timepoint."""
     statistic_weighting: str = "own"
     """Internal transitions weight every cluster by its own timepoint."""
 
@@ -751,7 +755,7 @@ class MONIC:
     """
 
     overlap_weighting = "target"
-    """Overlap weights every record by its weight at the later timepoint, as in
+    """Overlap weights every instance by its weight at the later timepoint, as in
     Definition 3."""
     statistic_weighting = "own"
     """Internal transitions weight every cluster by its own timepoint, as in
@@ -868,10 +872,12 @@ def _check_invariants(
 
     # Overlap matrix row sums.
     assigned = frozenset().union(*target.clusters.values())
-    for (cluster_id, records), row_sum in zip(
+    for (cluster_id, instances), row_sum in zip(
         source.clusters.items(), report.overlap.sum(axis=1).tolist()
     ):
-        alive = {record for record in records if target.weights.get(record, 0.0) > 0}
+        alive = {
+            instance for instance in instances if target.weights.get(instance, 0.0) > 0
+        }
         if not alive:
             expected, holds = "0", row_sum == 0.0
         elif alive <= assigned:
@@ -895,10 +901,10 @@ def _check_invariants(
     # The four outcomes account for the whole of the earlier clustering.
     kinds = Counter(t.kind for t in report.external)
     n_accounted = (
-        kinds[ExternalKind.SURVIVED]
-        + kinds[ExternalKind.ABSORBED]
-        + kinds[ExternalKind.SPLIT]
-        + kinds[ExternalKind.DISAPPEARED]
+        kinds[TransitionType.SURVIVED]
+        + kinds[TransitionType.ABSORBED]
+        + kinds[TransitionType.SPLIT]
+        + kinds[TransitionType.DISAPPEARED]
     )
     if n_accounted != len(source.clusters):
         raise AssertionError(
@@ -921,9 +927,9 @@ def _check_invariants(
 
 
 class MonitorableClusterer(ABC):
-    """A clusterer that can say which records are in which of its clusters.
+    """A clusterer that can say which instances are in which of its clusters.
 
-    MONIC compares two clusterings record by record (Definition 3), so it needs
+    MONIC compares two clusterings instance by instance (Definition 3), so it needs
     the members of every cluster, not only its centre. A clusterer that
     implements this interface can be monitored by :py:class:`MONICMonitor`:
 
@@ -935,9 +941,9 @@ class MonitorableClusterer(ABC):
             def get_clustering(self) -> Clustering:
                 return Clustering(
                     timepoint=self.instances_seen,
-                    clusters=...,  # cluster id -> ids of its records
-                    weights=...,  # record id -> ageing weight in [0, 1]
-                    points=...,  # record id -> feature vector
+                    clusters=...,  # cluster id -> ids of its instances
+                    weights=...,  # instance id -> ageing weight in [0, 1]
+                    points=...,  # instance id -> feature vector
                 )
     """
 
@@ -947,10 +953,10 @@ class MonitorableClusterer(ABC):
 
         For the transitions between two calls to be meaningful:
 
-        * A record keeps its id from one call to the next.
-        * The weights cover every record the model still holds, including
+        * An instance keeps its id from one call to the next.
+        * The weights cover every instance the model still holds, including
           those in no cluster, and are their ageing weights now (Definition 2).
-          A record that is left out, or has weight 0, has aged out, even if it
+          An instance that is left out, or has weight 0, has aged out, even if it
           is in a cluster.
         * The timepoint is later than that of the previous call.
 
@@ -958,7 +964,7 @@ class MonitorableClusterer(ABC):
         survived cluster is skipped: no internal transitions are reported, and
         the strict lifetime of every cluster stays at 1.
 
-        :return: The clusters of the model now, with their records.
+        :return: The clusters of the model now, with their instances.
         """
 
 

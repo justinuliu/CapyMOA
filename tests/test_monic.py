@@ -8,14 +8,13 @@ from capymoa.core import Instance
 from capymoa.evaluation.monic import (
     MONIC,
     Clustering,
-    ExternalKind,
     ExternalTransition,
-    InternalKind,
     InternalTransition,
     Lifetime,
     MONICMonitor,
     MonitorableClusterer,
     PassforwardRatios,
+    TransitionType,
     _check_invariants,
     advance_lifetimes,
     build_overlap_matrix,
@@ -34,13 +33,15 @@ def _clustering(
     clusters: dict[int, set[int]],
     weights: dict[int, float] | None = None,
 ) -> Clustering:
-    """Build a clustering, weighting every clustered record 1 unless told otherwise."""
+    """Build a clustering, giving every clustered instance weight 1 by default."""
     if weights is None:
-        weights = {record: 1.0 for records in clusters.values() for record in records}
+        weights = {
+            instance: 1.0 for instances in clusters.values() for instance in instances
+        }
     return Clustering(timepoint, clusters, weights)
 
 
-# Five clusters at t_i over records 1..19.
+# Five clusters at t_i over instances 1..19.
 SOURCE_CLUSTERS = {
     0: {1, 2, 3, 4},
     1: {5, 6, 7, 8},
@@ -48,7 +49,7 @@ SOURCE_CLUSTERS = {
     3: {14, 15},
     4: {16, 17, 18, 19},
 }
-# Four clusters at t_j over the same records plus the new records 20 and 21.
+# Four clusters at t_j over the same instances plus the new instances 20 and 21.
 TARGET_CLUSTERS = {
     0: {1, 2, 3, 4, 16, 20, 21},
     1: {5, 6, 7, 8, 14, 15},
@@ -89,9 +90,9 @@ def test_overlap_matrix_matches_pairwise_overlap():
 @pytest.mark.parametrize(
     "old_weight", [1.0, 0.5, 0.125], ids=["uniform", "half", "eighth"]
 )
-def test_rows_sum_to_one_when_all_records_survive(old_weight: float):
-    # Every t_i record keeps a positive weight at t_j and is assigned to a cluster.
-    target_weights = {record: old_weight for record in range(1, 20)}
+def test_rows_sum_to_one_when_all_instances_survive(old_weight: float):
+    # Every t_i instance keeps a positive weight at t_j and is assigned to a cluster.
+    target_weights = {instance: old_weight for instance in range(1, 20)}
     target_weights |= {20: 1.0, 21: 1.0}
     # Unequal weights inside a cluster, so the weights do not simply cancel out.
     target_weights |= {9: 1.0, 16: 1.0}
@@ -103,8 +104,8 @@ def test_rows_sum_to_one_when_all_records_survive(old_weight: float):
     np.testing.assert_allclose(matrix.sum(axis=1), 1.0, rtol=0, atol=TOLERANCE)
 
 
-def test_row_sums_below_one_when_surviving_record_is_unassigned():
-    # Record 4 is still alive at t_j but belongs to no cluster.
+def test_row_sums_below_one_when_surviving_instance_is_unassigned():
+    # Instance 4 is still alive at t_j but belongs to no cluster.
     source = _clustering(0, {0: {1, 2, 3, 4}})
     target = _clustering(1, {0: {1, 2, 3}}, {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0})
 
@@ -132,8 +133,8 @@ def test_fully_aged_out_cluster_has_zero_overlap(aged_out_weights: dict[int, flo
 
 
 def test_partial_ageing_uses_target_weights():
-    # At t_i all four records of X weigh 1. By t_j record 1 has aged out and
-    # record 2 has decayed to 0.5.
+    # At t_i all four instances of X weigh 1. By t_j instance 1 has aged out and
+    # instance 2 has decayed to 0.5.
     source = _clustering(0, {0: {1, 2, 3, 4}})
     target = _clustering(1, {0: {2, 3}, 1: {4}}, {2: 0.5, 3: 1.0, 4: 1.0})
 
@@ -164,7 +165,7 @@ def test_overlap_to_union_equals_sum_of_overlaps():
         21: 1.0,
         22: 1.0,
         23: 1.0,
-    }  # record 8 has aged out
+    }  # instance 8 has aged out
     target = Clustering(1, partition, weights)
     matrix = build_overlap_matrix(_clustering(0, {0: x}), target)
 
@@ -204,11 +205,11 @@ def test_clustering_rejects_invalid_input(
 
 # External transitions (Section 4.1). Expected labels follow Table 1.
 
-SURVIVED = ExternalKind.SURVIVED
-ABSORBED = ExternalKind.ABSORBED
-SPLIT = ExternalKind.SPLIT
-DISAPPEARED = ExternalKind.DISAPPEARED
-EMERGED = ExternalKind.EMERGED
+SURVIVED = TransitionType.SURVIVED
+ABSORBED = TransitionType.ABSORBED
+SPLIT = TransitionType.SPLIT
+DISAPPEARED = TransitionType.DISAPPEARED
+EMERGED = TransitionType.EMERGED
 
 
 def _detect(
@@ -220,8 +221,8 @@ def _detect(
 ) -> tuple[ExternalTransition, ...]:
     """Detect transitions with unit weights.
 
-    :param alive: Records alive at t_j. Defaults to the clustered records, so
-        that every other record of t_i has aged out.
+    :param alive: Instances alive at t_j. Defaults to the clustered instances, so
+        that every other instance of t_i has aged out.
     """
     if alive is None:
         alive = set().union(*target_clusters.values())
@@ -292,7 +293,7 @@ def test_two_way_split():
 
 
 def test_split_excludes_cluster_below_tau_split():
-    # Overlaps 0.4, 0.4 and 0.1; record 10 is alive but unassigned.
+    # Overlaps 0.4, 0.4 and 0.1; instance 10 is alive but unassigned.
     transitions = _detect(
         {0: set(range(1, 11))},
         {5: {1, 2, 3, 4}, 6: {5, 6, 7, 8}, 7: {9}},
@@ -471,7 +472,7 @@ def test_tau_below_one_half_warns():
     with pytest.warns(UserWarning, match="below 0.5"):
         transitions = _detect({0: {1, 2, 3, 4}}, {5: {1, 2}, 6: {3}}, tau=0.45)
 
-    # Overlap 2 / 3: record 4 has aged out.
+    # Overlap 2 / 3: instance 4 has aged out.
     assert transitions == (
         ExternalTransition(SURVIVED, 0, (5,)),
         ExternalTransition(EMERGED, None, (6,)),
@@ -480,23 +481,23 @@ def test_tau_below_one_half_warns():
 
 # Internal transitions (Section 4.2, Table 2) of survived clusters.
 
-SHRUNK = InternalKind.SHRUNK
-EXPANDED = InternalKind.EXPANDED
-COMPACTED = InternalKind.COMPACTED
-DIFFUSED = InternalKind.DIFFUSED
-SHIFTED = InternalKind.SHIFTED
+SHRUNK = TransitionType.SHRUNK
+EXPANDED = TransitionType.EXPANDED
+COMPACTED = TransitionType.COMPACTED
+DIFFUSED = TransitionType.DIFFUSED
+SHIFTED = TransitionType.SHIFTED
 
 Points = dict[int, list[float]]
 
 
-def _cross(records: range, radius: float = 1.0, centre: float = 0.0) -> Points:
+def _cross(instances: range, radius: float = 1.0, centre: float = 0.0) -> Points:
     """Points at ``radius`` from ``(centre, 0)`` along both axes, repeated to
-    cover ``records``: mean ``(centre, 0)``, sigma ``radius`` and no skewness,
-    provided the number of records is a multiple of four."""
+    cover ``instances``: mean ``(centre, 0)``, sigma ``radius`` and no skewness,
+    provided the number of instances is a multiple of four."""
     arms = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
     return {
-        record: [centre + radius * arms[i % 4][0], radius * arms[i % 4][1]]
-        for i, record in enumerate(records)
+        instance: [centre + radius * arms[i % 4][0], radius * arms[i % 4][1]]
+        for i, instance in enumerate(instances)
     }
 
 
@@ -521,7 +522,7 @@ def _internal(
         target_points,
     )
     external = detect_external_transitions(source, target)
-    assert external == (ExternalTransition(ExternalKind.SURVIVED, 0, (5,)),)
+    assert external == (ExternalTransition(TransitionType.SURVIVED, 0, (5,)),)
 
     with np.errstate(all="raise"):
         (internal,) = detect_internal_transitions(
@@ -537,7 +538,7 @@ def test_internal_no_change_is_empty_set():
 
 
 def test_internal_shrinks():
-    # Eight records of weight 1 become four; mean, sigma and skewness are unchanged.
+    # Eight instances of weight 1 become four; mean, sigma and skewness are unchanged.
     assert _internal(_cross(range(8)), _cross(range(4))).kinds == {SHRUNK}
 
 
@@ -561,7 +562,7 @@ def test_internal_becomes_more_diffuse():
     ("shift", "expected"),
     [(0.4, set()), (0.6, {SHIFTED}), (-0.6, {SHIFTED}), (3.0, {SHIFTED})],
 )
-def test_internal_mean_shift(shift: float, expected: set[InternalKind]):
+def test_internal_mean_shift(shift: float, expected: set[TransitionType]):
     # The mean moves by `shift` while sigma stays 1, against tau_mean = 0.5.
     internal = _internal(_cross(range(4)), _cross(range(4), centre=shift))
 
@@ -580,14 +581,14 @@ def test_internal_skewness_shift():
 
 
 def test_internal_groups_combine():
-    # Twice the records, half the sigma, and a mean moved by 3.
+    # Twice the instances, half the sigma, and a mean moved by 3.
     internal = _internal(_cross(range(4)), _cross(range(8), radius=0.5, centre=3.0))
 
     assert internal.kinds == {EXPANDED, COMPACTED, SHIFTED}
 
 
 def test_internal_statistics_use_each_clusters_own_weights():
-    # Every record decays from weight 1 at t_i to 0.5 at t_j, so the cluster
+    # Every instance decays from weight 1 at t_i to 0.5 at t_j, so the cluster
     # weighs 4 and then 2. With t_j weights on both sides nothing would change.
     points = _cross(range(4))
     internal = _internal(points, points, target_weights=dict.fromkeys(points, 0.5))
@@ -596,13 +597,13 @@ def test_internal_statistics_use_each_clusters_own_weights():
 
 
 def test_internal_weighted_moments():
-    # At t_j the record at (1, 0) weighs 1 and the other three weigh 0.25. The
+    # At t_j the instance at (1, 0) weighs 1 and the other three weigh 0.25. The
     # weighted mean moves to (3 / 7, 0), about 0.43, and sigma becomes
     # sqrt(40) / 7, about 0.90. tau_skew is raised to isolate the mean.
     points = _cross(range(4))
     target_weights = {0: 1.0, 1: 0.25, 2: 0.25, 3: 0.25}
 
-    def kinds(tau_mean: float) -> frozenset[InternalKind]:
+    def kinds(tau_mean: float) -> frozenset[TransitionType]:
         return _internal(
             points,
             points,
@@ -615,14 +616,14 @@ def test_internal_weighted_moments():
     assert kinds(0.45) == {SHRUNK}
 
 
-@pytest.mark.parametrize("n_records", [4, 400, 40_000])
-def test_internal_size_thresholds_are_relative(n_records: int):
+@pytest.mark.parametrize("n_instances", [4, 400, 40_000])
+def test_internal_size_thresholds_are_relative(n_instances: int):
     # epsilon = 0.1 is a fraction of the cluster weight: 5% growth is no
     # change and 25% growth is an expansion, whatever the absolute difference.
-    source_points = _cross(range(n_records))
+    source_points = _cross(range(n_instances))
 
-    grown_5_percent = _cross(range(n_records * 105 // 100))
-    grown_25_percent = _cross(range(n_records * 125 // 100))
+    grown_5_percent = _cross(range(n_instances * 105 // 100))
+    grown_25_percent = _cross(range(n_instances * 125 // 100))
 
     assert EXPANDED not in _internal(source_points, grown_5_percent).kinds
     assert EXPANDED in _internal(source_points, grown_25_percent).kinds
@@ -633,7 +634,9 @@ def test_internal_feature_thresholds_are_scale_invariant(scale: float):
     # delta and tau_mean are fractions of sigma(X), so rescaling the features
     # of both clusters changes no label.
     def scaled(points: Points) -> Points:
-        return {record: [scale * v for v in point] for record, point in points.items()}
+        return {
+            instance: [scale * v for v in point] for instance, point in points.items()
+        }
 
     source_points = scaled(_cross(range(4)))
 
@@ -651,8 +654,8 @@ def test_internal_feature_thresholds_are_scale_invariant(scale: float):
 
 def test_internal_zero_spread_cluster():
     # sigma(X) = 0: any spread is more diffuse and any move is a shift.
-    point = {record: [2.0, 3.0] for record in range(4)}
-    moved = {record: [2.0, 3.5] for record in range(4)}
+    point = {instance: [2.0, 3.0] for instance in range(4)}
+    moved = {instance: [2.0, 3.5] for instance in range(4)}
     spread = {0: [3.0, 3.0], 1: [1.0, 3.0], 2: [2.0, 4.0], 3: [2.0, 2.0]}
 
     assert _internal(point, point).kinds == set()
@@ -664,8 +667,8 @@ def test_internal_zero_spread_cluster():
 def test_internal_constant_feature_has_no_skewness():
     # 0.1 is not exactly representable, so the second feature has a variance
     # of rounding error only. Its skewness must be 0, not noise.
-    source_points = {record: [float(record), 0.1] for record in range(7)}
-    target_points = {record: [float(record), 0.1 * 3] for record in range(7)}
+    source_points = {instance: [float(instance), 0.1] for instance in range(7)}
+    target_points = {instance: [float(instance), 0.1 * 3] for instance in range(7)}
 
     assert _internal(source_points, target_points, tau_mean=1.0).kinds == set()
 
@@ -673,7 +676,7 @@ def test_internal_constant_feature_has_no_skewness():
 def test_internal_skipped_when_feature_dimensions_differ():
     source_points = _cross(range(4))
     target_points = {
-        record: [*point, 0.0] for record, point in _cross(range(8)).items()
+        instance: [*point, 0.0] for instance, point in _cross(range(8)).items()
     }
 
     internal = _internal(source_points, target_points)
@@ -702,7 +705,7 @@ def test_internal_skipped_without_points(missing: str):
 def test_internal_only_for_survived_clusters():
     # Cluster 0 survives as 5, clusters 1 and 2 are absorbed by 6, cluster 3
     # disappears and cluster 7 emerges.
-    points = {record: [float(record), 0.0] for record in range(12)}
+    points = {instance: [float(instance), 0.0] for instance in range(12)}
     weights = dict.fromkeys(points, 1.0)
     source = Clustering(
         0, {0: {0, 1}, 1: {2, 3}, 2: {4, 5}, 3: {6, 7}}, weights, points
@@ -751,15 +754,15 @@ def test_clustering_rejects_invalid_points(points: dict, message: str):
 
 
 def _unit_clustering(timepoint: float, clusters: dict[int, set[int]]) -> Clustering:
-    """Clustering whose alive records are the clustered ones, all of weight 1 and
+    """Clustering whose alive instances are the clustered ones, all of weight 1 and
     all at the same point, so that only a change of size is an internal
     transition."""
-    records = set().union(*clusters.values())
+    instances = set().union(*clusters.values())
     return Clustering(
         timepoint,
         clusters,
-        dict.fromkeys(records, 1.0),
-        {record: [0.0] for record in records},
+        dict.fromkeys(instances, 1.0),
+        {instance: [0.0] for instance in instances},
     )
 
 
@@ -872,7 +875,7 @@ def test_lifetime_invariant_over_five_timepoints():
 
 
 def test_absorption_continues_the_heavier_cluster():
-    # Cluster 0 is older but contributes 2 records to cluster 5; cluster 1 is
+    # Cluster 0 is older but contributes 2 instances to cluster 5; cluster 1 is
     # younger and contributes 3.
     source = _unit_clustering(0, {0: {1, 2}, 1: {3, 4, 5}})
     target = _unit_clustering(1, {5: {1, 2, 3, 4, 5}})
@@ -1047,7 +1050,7 @@ def test_monic_validates_thresholds_at_construction(kwargs: dict[str, float]):
 
 
 def test_garbage_cluster_wins_matches_unless_dissolved():
-    # Cluster 0 scatters: at t_j all of its records are in the garbage cluster
+    # Cluster 0 scatters: at t_j all of its instances are in the garbage cluster
     # 9, along with the leftovers of other clusters.
     source = _unit_clustering(0, {0: {1, 2, 3, 4}})
     target = _unit_clustering(1, {9: {1, 2, 3, 4, 20, 21, 22, 23, 24}, 5: {30, 31}})
@@ -1060,7 +1063,7 @@ def test_garbage_cluster_wins_matches_unless_dissolved():
         ExternalTransition(DISAPPEARED, 0, ()),
         ExternalTransition(EMERGED, None, (5,)),
     )
-    # The dissolved records are still alive, so they keep their weights.
+    # The dissolved instances are still alive, so they keep their weights.
     assert target.without_clusters([9]).weights == target.weights
 
 
@@ -1132,7 +1135,7 @@ class _ScriptedClusterer(_PlainClusterer, MonitorableClusterer):
 
 
 # Cluster 0 splits in two at timepoint 2, while cluster 1 survives. At
-# timepoint 3 records 1 and 2 have aged out, so the cluster holding them
+# timepoint 3 instances 1 and 2 have aged out, so the cluster holding them
 # disappears, and the other two are absorbed by one cluster.
 SCRIPT = [
     _unit_clustering(1, {0: {1, 2, 3, 4}, 1: {5, 6}}),
@@ -1202,7 +1205,7 @@ def test_monitor_validates_arguments(kwargs: dict):
 
 def _report_for_invariants():
     """A report with a survival, a split, two disappearances and an emergence.
-    Record 10 of cluster 2 is alive at t_j but unassigned, and cluster 3 has
+    Instance 10 of cluster 2 is alive at t_j but unassigned, and cluster 3 has
     aged out."""
     monic = MONIC(tau=0.6, debug=True)
     source = _unit_clustering(0, {0: {1, 2}, 1: {3, 4, 5, 6}, 2: {10, 11}, 3: {30}})
@@ -1248,7 +1251,7 @@ def _corrupt_row_sum_below_one(report):
     return dataclasses.replace(report, overlap=overlap)
 
 
-def _corrupt_row_sum_with_unassigned_record(report):
+def _corrupt_row_sum_with_unassigned_instance(report):
     overlap = report.overlap.copy()
     overlap[2, 0] = 1.5
     return dataclasses.replace(report, overlap=overlap)
@@ -1295,7 +1298,7 @@ def _corrupt_missing_lifetime(report):
         (_corrupt_row_sum_above_one, "overlaps of cluster 0 sum to 1.5, expected 1"),
         (_corrupt_row_sum_below_one, "overlaps of cluster 1 sum to 0.75, expected 1"),
         (
-            _corrupt_row_sum_with_unassigned_record,
+            _corrupt_row_sum_with_unassigned_instance,
             "overlaps of cluster 2 sum to 1.5, expected at most 1",
         ),
         (
@@ -1316,8 +1319,8 @@ def test_debug_mode_rejects_corrupt_reports(corrupt, message: str):
         _check_invariants(source, target, corrupt(report))
 
 
-def test_debug_mode_row_sum_may_be_below_one_with_unassigned_records():
-    # Record 4 is alive at t_j but in no cluster, so the row sums to 0.75.
+def test_debug_mode_row_sum_may_be_below_one_with_unassigned_instances():
+    # Instance 4 is alive at t_j but in no cluster, so the row sums to 0.75.
     monic = MONIC(debug=True)
     monic.update(_unit_clustering(0, {0: {1, 2, 3, 4}}))
 

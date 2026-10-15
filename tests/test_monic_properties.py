@@ -7,8 +7,8 @@ from hypothesis import strategies as st
 
 from capymoa.evaluation.monic import (
     Clustering,
-    ExternalKind,
     Lifetime,
+    TransitionType,
     advance_lifetimes,
     detect_external_transitions,
     detect_internal_transitions,
@@ -20,29 +20,29 @@ WEIGHTS = [0.0, 0.25, 0.5, 1.0]
 
 @st.composite
 def clustering_pairs(draw: st.DrawFn) -> tuple[Clustering, Clustering]:
-    """Two clusterings over a shared pool of records.
+    """Two clusterings over a shared pool of instances.
 
-    Each record is independently placed in a cluster of each clustering or left
+    Each instance is independently placed in a cluster of each clustering or left
     out of it, and given a weight at the later timepoint. A weight of 0 or being
     left out of both the clusters and the weights models ageing out.
     """
-    n_records = draw(st.integers(0, 24))
+    n_instances = draw(st.integers(0, 24))
     cluster = st.none() | st.integers(0, 4)
 
     source_clusters: dict[int, set[int]] = {}
     target_clusters: dict[int, set[int]] = {}
     target_weights: dict[int, float] = {}
-    for record in range(n_records):
+    for instance in range(n_instances):
         source_cluster = draw(cluster)
         if source_cluster is not None:
-            source_clusters.setdefault(source_cluster, set()).add(record)
+            source_clusters.setdefault(source_cluster, set()).add(instance)
         target_cluster = draw(cluster)
         if target_cluster is not None:
-            target_clusters.setdefault(target_cluster, set()).add(record)
+            target_clusters.setdefault(target_cluster, set()).add(instance)
         if target_cluster is not None or draw(st.booleans()):
-            target_weights[record] = draw(st.sampled_from(WEIGHTS))
+            target_weights[instance] = draw(st.sampled_from(WEIGHTS))
 
-    source_weights = dict.fromkeys(range(n_records), 1.0)
+    source_weights = dict.fromkeys(range(n_instances), 1.0)
     return (
         Clustering(0, source_clusters, source_weights),
         Clustering(1, target_clusters, target_weights),
@@ -60,8 +60,8 @@ def test_external_transitions_label_every_cluster_once(
 ):
     source, target = pair
     transitions = detect_external_transitions(source, target, tau, tau_split)
-    external = [t for t in transitions if t.kind is not ExternalKind.EMERGED]
-    emerged = [t for t in transitions if t.kind is ExternalKind.EMERGED]
+    external = [t for t in transitions if t.kind is not TransitionType.EMERGED]
+    emerged = [t for t in transitions if t.kind is TransitionType.EMERGED]
 
     # Every cluster of zeta_i receives exactly one label.
     assert [t.source for t in external] == list(source.cluster_ids)
@@ -77,26 +77,26 @@ def test_external_transitions_label_every_cluster_once(
     # Each label satisfies its indicator in Table 1.
     def overlaps_of(source_id: int) -> dict[int, float]:
         return {
-            target_id: overlap(source.clusters[source_id], records, target.weights)
-            for target_id, records in target.clusters.items()
+            target_id: overlap(source.clusters[source_id], instances, target.weights)
+            for target_id, instances in target.clusters.items()
         }
 
     n_matched_by: dict[int, int] = {}
     for t in external:
-        if t.kind in (ExternalKind.SURVIVED, ExternalKind.ABSORBED):
+        if t.kind in (TransitionType.SURVIVED, TransitionType.ABSORBED):
             n_matched_by[t.targets[0]] = n_matched_by.get(t.targets[0], 0) + 1
 
     for t in external:
         overlaps = overlaps_of(t.source)
         best = max(overlaps.values(), default=0.0)
-        if t.kind in (ExternalKind.SURVIVED, ExternalKind.ABSORBED):
+        if t.kind in (TransitionType.SURVIVED, TransitionType.ABSORBED):
             (match,) = t.targets
             assert overlaps[match] == best >= tau
-            assert (n_matched_by[match] > 1) == (t.kind is ExternalKind.ABSORBED)
+            assert (n_matched_by[match] > 1) == (t.kind is TransitionType.ABSORBED)
         else:
             assert best < tau
             candidates = {y for y, value in overlaps.items() if value >= tau_split}
-            if t.kind is ExternalKind.SPLIT:
+            if t.kind is TransitionType.SPLIT:
                 assert set(t.targets) == candidates
                 assert len(t.targets) >= 2
             else:
@@ -105,23 +105,23 @@ def test_external_transitions_label_every_cluster_once(
 
 @st.composite
 def histories(draw: st.DrawFn) -> list[Clustering]:
-    """Clusterings at successive timepoints over a shared pool of records.
+    """Clusterings at successive timepoints over a shared pool of instances.
 
-    At each timepoint a record is either clustered, with a weight and a point,
+    At each timepoint an instance is either clustered, with a weight and a point,
     or has aged out.
     """
-    n_records = draw(st.integers(1, 16))
+    n_instances = draw(st.integers(1, 16))
     clusterings = []
     for timepoint in range(draw(st.integers(2, 6))):
         clusters: dict[int, set[int]] = {}
         weights: dict[int, float] = {}
         points: dict[int, list[float]] = {}
-        for record in range(n_records):
+        for instance in range(n_instances):
             cluster = draw(st.none() | st.integers(0, 3))
             if cluster is not None:
-                clusters.setdefault(cluster, set()).add(record)
-                weights[record] = draw(st.sampled_from([0.5, 1.0]))
-                points[record] = [float(draw(st.integers(0, 2)))]
+                clusters.setdefault(cluster, set()).add(instance)
+                weights[instance] = draw(st.sampled_from([0.5, 1.0]))
+                points[instance] = [float(draw(st.integers(0, 2)))]
         clusterings.append(Clustering(timepoint, clusters, weights, points))
     return clusterings
 
