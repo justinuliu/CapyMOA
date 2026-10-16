@@ -74,6 +74,10 @@ Consequences:
 - [ ] **Noise and garbage clusters.** Def. 1 demands a complete partition with no outliers. The K-means "cluster 0" garbage bin distorts matching badly, since it is large and therefore wins matches. Any clusterer with a noise label needs an explicit policy.
 - [ ] **Building the overlap matrix.** The `O(K²)` claim assumes `M` is already computed. Build it with an inverted index (`record_id -> cluster index at t_j`), then a single pass over each `X`, giving `O(|D|)` rather than `O(K² · |X|)`.
 
+## 7. Open interface questions
+
+- [ ] **`MonitorableClusterer.get_clustering` may need redefining** (noted 2026-10-16). Instead of the clusterer reporting the instances it holds, the caller would give it a set of instances and the clusterer would predict a cluster for each. Still to decide: who provides the ageing weights (Def. 2) for the given instances, and whether the same set is passed at every timepoint.
+
 ## Suggested first steps
 
 1. Implement `overlap` and the transition detector against a hand-built toy example with 4 or 5 clusters where the answer is known by inspection.
