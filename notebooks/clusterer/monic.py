@@ -237,26 +237,37 @@ class WindowedLeader(Clusterer, MonitorableClusterer):
 # %% [markdown]
 # ## Running the monitor
 #
-# `MONICMonitor` trains the clusterer on the stream. Every `check_interval`
-# instances is a *timepoint*, at which it asks the clusterer for its clustering,
-# compares it with the one of the previous timepoint and returns a
-# `TransitionReport`. `debug=True` checks the invariants of MONIC at every timepoint
-# and raises an `AssertionError` if one is violated.
+# The clusterer is trained on the stream. Every `CHECK_INTERVAL` instances is a
+# *timepoint*, at which `MONIC` is given the clusterer's clustering. It compares it
+# with the clustering of the previous timepoint and returns a `TransitionReport`.
+# `debug=True` checks the invariants of MONIC at every timepoint and raises an
+# `AssertionError` if one is violated.
 
 # %%
-from capymoa.evaluation.monic import MONICMonitor
+from capymoa.evaluation.monic import MONIC
 
 stream = drifting_stream()
 clusterer = WindowedLeader(stream.get_schema())
-monitor = MONICMonitor(
-    clusterer,
-    check_interval=CHECK_INTERVAL,
-    tau=0.5,
-    tau_split=0.1,
-    debug=True,
-)
+monic = MONIC(tau=0.5, tau_split=0.1, debug=True)
+
+clusterings = []
+reports = []
+n_instances = 0
+while stream.has_more_instances():
+    clusterer.train(stream.next_instance())
+    n_instances += 1
+    if n_instances % CHECK_INTERVAL == 0:
+        clusterings.append(clusterer.get_clustering())
+        reports.append(monic.update(clusterings[-1]))
+
+# %% [markdown]
+# ### Transition log
+#
+# Each timepoint is headed by the passforward ratio of the previous clustering: the
+# portion of its clusters that survived or were absorbed.
 
 
+# %%
 def where(clustering: Clustering, cluster_id: int) -> str:
     """Describe a cluster by where it is, since its id means nothing over time."""
     points = [
@@ -266,27 +277,14 @@ def where(clustering: Clustering, cluster_id: int) -> str:
     return f"({x}, {y})"
 
 
-# %% [markdown]
-# ### Transition log
-#
-# Each timepoint is headed by the passforward ratio of the previous clustering: the
-# portion of its clusters that survived or were absorbed.
-
-# %%
-clusterings = []
-reports = []
 previous = None
-for timepoint, report in enumerate(monitor.monitor(stream)):
-    clustering = monitor.clustering
-    clusterings.append(clustering)
-    reports.append(report)
-
+for timepoint, (clustering, report) in enumerate(zip(clusterings, reports)):
     internal = {
         t.source: sorted(kind.name for kind in t.kinds) for t in report.internal
     }
     print(
         f"timepoint {timepoint:2d}  "
-        f"instances {monitor.instances_seen:5d}  "
+        f"instances {(timepoint + 1) * CHECK_INTERVAL:5d}  "
         f"clusters {len(clustering.clusters)}  "
         f"passforward {report.ratios.passforward:.2f}"
     )
@@ -374,11 +372,11 @@ print(overlaps_of(7, "(-12, 0)").to_string())
 # a split.
 #
 # The clusterings do not depend on the thresholds, so there is no need to run the
-# clusterer again. `MONIC` takes clusterings directly, and the ones collected above
-# can be replayed with other thresholds.
+# clusterer again. The ones collected above can be replayed through a new `MONIC`
+# with other thresholds.
 
 # %%
-from capymoa.evaluation.monic import MONIC, TransitionType
+from capymoa.evaluation.monic import TransitionType
 
 EXTERNAL = [
     TransitionType.SURVIVED,

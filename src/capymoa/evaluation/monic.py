@@ -4,13 +4,10 @@ MONIC [#f0]_ observes clusterings produced at successive timepoints and
 classifies what happened to each cluster: whether it survived, was absorbed,
 was split or disappeared, which clusters emerged, and how the survivors changed.
 
-There are two ways in:
-
-* :py:class:`MONIC` takes one :py:class:`Clustering` per timepoint. Use
-  it when you cluster the data of each timepoint yourself, as the paper does.
-* :py:class:`MONICMonitor` trains a clusterer on a stream and asks it for its
-  clustering at every timepoint. The clusterer must implement
-  :py:class:`MonitorableClusterer`.
+:py:class:`MONIC` takes one :py:class:`Clustering` per timepoint. The
+clusterings can come from clustering the data of each timepoint yourself, as
+the paper does, or from a clusterer on a stream that implements
+:py:class:`MonitorableClusterer`.
 
 See ``docs/MONIC-design.md`` for the decisions taken where the paper is silent.
 
@@ -23,7 +20,7 @@ See ``docs/MONIC-design.md`` for the decisions taken where the paper is silent.
 import warnings
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from enum import Enum
@@ -31,27 +28,18 @@ from typing import NamedTuple
 
 import numpy as np
 
-from capymoa.base import Clusterer
-from capymoa.core import Instance
-from capymoa.stream import Stream
-
 __all__ = [
     "MONIC",
     "Clustering",
     "ExternalTransition",
     "InternalTransition",
     "Lifetime",
-    "MONICMonitor",
     "MonitorableClusterer",
     "PassforwardRatios",
     "TransitionReport",
     "TransitionType",
-    "advance_lifetimes",
     "build_overlap_matrix",
-    "detect_external_transitions",
-    "detect_internal_transitions",
     "overlap",
-    "passforward_ratios",
 ]
 
 
@@ -90,7 +78,7 @@ class Clustering:
     """Maps an instance id to its feature vector at this timepoint. Only internal
     transitions need it. If either of two clusterings has no points, the
     internal analysis of every survived cluster between them is skipped, so its
-    strict lifetime restarts at 1 (see :py:func:`advance_lifetimes`)."""
+    strict lifetime restarts at 1 (see :py:class:`Lifetime`)."""
 
     def __post_init__(self) -> None:
         clusters = {
@@ -207,35 +195,56 @@ def build_overlap_matrix(source: Clustering, target: Clustering) -> np.ndarray:
         ``source`` to the ``j``-th cluster of ``target``. A row is all zeros if
         every instance of its cluster has aged out.
     """
-    intersections, totals = _intersection_weights(source, target)
-    return _divide_or_zero(intersections, totals[:, np.newaxis])
+    return _overlap_weights(source, target).forward
 
 
-def _intersection_weights(
-    source: Clustering, target: Clustering
-) -> tuple[np.ndarray, np.ndarray]:
+class _OverlapWeights(NamedTuple):
+    """Numerators and denominators of Definition 3 for every pair of clusters of
+    two clusterings, using the weights of the later one."""
+
+    intersections: np.ndarray
+    """Entry ``[i, j]`` is the weight of the instances that the ``i``-th cluster
+    of the earlier clustering shares with the ``j``-th cluster of the later one."""
+    source_totals: np.ndarray
+    """Entry ``i`` is the weight of the ``i``-th cluster of the earlier clustering."""
+    target_totals: np.ndarray
+    """Entry ``j`` is the weight of the ``j``-th cluster of the later clustering."""
+
+    @property
+    def forward(self) -> np.ndarray:
+        """The overlap matrix: entry ``[i, j]`` is the overlap of the ``i``-th
+        cluster of the earlier clustering to the ``j``-th cluster of the later one."""
+        return _divide_or_zero(self.intersections, self.source_totals[:, np.newaxis])
+
+    @property
+    def reverse(self) -> np.ndarray:
+        """Entry ``[i, j]`` is the overlap of the ``j``-th cluster of the later
+        clustering to the ``i``-th cluster of the earlier one."""
+        return _divide_or_zero(self.intersections, self.target_totals[np.newaxis, :])
+
+
+def _overlap_weights(source: Clustering, target: Clustering) -> _OverlapWeights:
     """Numerators and denominators of Definition 3, using the weights of ``target``.
 
-    :return: The weight of the intersection of every cluster of ``source`` with
-        every cluster of ``target``, and the weight of every cluster of
-        ``source``.
+    See :py:func:`build_overlap_matrix` for how they are computed.
     """
-    column_of = {
-        instance: column
-        for column, instances in enumerate(target.clusters.values())
-        for instance in instances
-    }
+    column_of: dict[int, int] = {}
+    target_totals = np.zeros(len(target.clusters))
+    for column, instances in enumerate(target.clusters.values()):
+        for instance in instances:
+            column_of[instance] = column
+            target_totals[column] += target.weights[instance]
 
     intersections = np.zeros((len(source.clusters), len(target.clusters)))
-    totals = np.zeros(len(source.clusters))
+    source_totals = np.zeros(len(source.clusters))
     for row, instances in enumerate(source.clusters.values()):
         for instance in instances:
             weight = target.weights.get(instance, 0.0)
-            totals[row] += weight
+            source_totals[row] += weight
             column = column_of.get(instance)
             if column is not None:
                 intersections[row, column] += weight
-    return intersections, totals
+    return _OverlapWeights(intersections, source_totals, target_totals)
 
 
 def _divide_or_zero(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -300,128 +309,32 @@ class ExternalTransition:
     disappeared cluster."""
 
 
-def detect_external_transitions(
-    source: Clustering,
-    target: Clustering,
-    tau: float = 0.5,
-    tau_split: float = 0.1,
-) -> tuple[ExternalTransition, ...]:
-    """Detect the external transitions from ``source`` to ``target`` (Table 1).
-
-    A cluster of ``source`` with a match in ``target`` survives, or is absorbed
-    if another cluster has the same match. The match is the cluster with the
-    largest overlap, provided that overlap is at least ``tau``. Ties are broken
-    by the larger reverse overlap, then by the order of the clusters in
-    ``target``. A cluster without a match is split if the clusters it overlaps
-    by at least ``tau_split`` together overlap it by at least ``tau``; otherwise
-    it disappears.
-
-    >>> source = Clustering(0, {0: {1, 2}, 1: {3, 4}}, dict.fromkeys(range(1, 5), 1.0))
-    >>> target = Clustering(1, {7: {1, 2, 5}, 8: {6}}, {1: 1.0, 2: 1.0, 5: 1.0, 6: 1.0})
-    >>> for transition in detect_external_transitions(source, target):
-    ...     print(transition.kind.name, transition.source, transition.targets)
-    SURVIVED 0 (7,)
-    DISAPPEARED 1 ()
-    EMERGED None (8,)
-
-    :param source: The clustering at the earlier timepoint ``t_i``.
-    :param target: The clustering at the later timepoint ``t_j``.
-    :param tau: The least overlap for one cluster to be the match of another.
-        Definition 4 restricts it to ``[0.5, 1]``; a smaller value is accepted
-        with a warning.
-    :param tau_split: The least overlap for a cluster to take part in a split.
-    :raises ValueError: Unless ``0 < tau_split < tau <= 1``.
-    :return: One transition for each cluster of ``source``, in order, followed
-        by one for each emerged cluster of ``target``, in order.
-    """
-    _check_external_thresholds(tau, tau_split)
-    return _external_transitions(source, target, tau, tau_split)
-
-
-def _check_external_thresholds(tau: float, tau_split: float) -> None:
-    """Validate the thresholds on behalf of a public function or constructor."""
-    if not 0.0 < tau_split < tau <= 1.0:
-        raise ValueError(
-            f"Thresholds must satisfy 0 < tau_split < tau <= 1, but got "
-            f"tau_split={tau_split} and tau={tau}."
-        )
-    if tau < 0.5:
-        warnings.warn(
-            f"tau={tau} is below 0.5, so a cluster may be matched by less than "
-            "half of its weight.",
-            stacklevel=3,
-        )
-
-
-def _external_transitions(
-    source: Clustering, target: Clustering, tau: float, tau_split: float
-) -> tuple[ExternalTransition, ...]:
-    """:py:func:`detect_external_transitions` without the threshold checks."""
-    intersections, totals = _intersection_weights(source, target)
-    forward = _divide_or_zero(intersections, totals[:, np.newaxis])
-    target_totals = np.array(
-        [
-            sum(target.weights[instance] for instance in instances)
-            for instances in target.clusters.values()
-        ]
-    )
-    reverse = _divide_or_zero(intersections, target_totals[np.newaxis, :])
-
-    # Pass 1: find the match of each cluster of ``source``, or failing that the
-    # clusters it is split into. A cluster with a match is never split.
-    match_of: dict[int, int] = {}
-    split_of: dict[int, list[int]] = {}
-    for row in range(len(source.clusters)):
-        candidates = np.flatnonzero(forward[row] >= tau).tolist()
-        if candidates:
-            match_of[row] = max(
-                candidates,
-                key=lambda column: (
-                    forward[row, column],
-                    reverse[row, column],
-                    -column,
-                ),
-            )
-            continue
-        candidates = np.flatnonzero(forward[row] >= tau_split).tolist()
-        # Clusters are disjoint, so the overlap to their union is the sum of
-        # their intersection weights over the weight of the cluster.
-        if candidates and intersections[row, candidates].sum() / totals[row] >= tau:
-            split_of[row] = candidates
-
-    # Pass 2: a cluster of ``target`` matched by one cluster is its survival,
-    # and one matched by several has absorbed them.
-    n_matched_by = Counter(match_of.values())
-
-    target_ids = target.cluster_ids
-    transitions = []
-    produced: set[int] = set()
-    for row, source_id in enumerate(source.clusters):
-        if row in match_of:
-            column = match_of[row]
-            absorbed = n_matched_by[column] > 1
-            kind = TransitionType.ABSORBED if absorbed else TransitionType.SURVIVED
-            targets: tuple[int, ...] = (target_ids[column],)
-        elif row in split_of:
-            kind = TransitionType.SPLIT
-            targets = tuple(target_ids[column] for column in split_of[row])
-        else:
-            kind = TransitionType.DISAPPEARED
-            targets = ()
-        produced.update(targets)
-        transitions.append(ExternalTransition(kind, source_id, targets))
-
-    transitions.extend(
-        ExternalTransition(TransitionType.EMERGED, None, (target_id,))
-        for target_id in target_ids
-        if target_id not in produced
-    )
-    return tuple(transitions)
-
-
 @dataclass(frozen=True)
 class InternalTransition:
-    """The internal transitions of one survived cluster."""
+    """The internal transitions of one survived cluster (Table 2).
+
+    A cluster is described by its weight, its mean, its spread ``sigma`` (the
+    root mean square distance of its instances to the mean) and its skewness in
+    each feature. Each cluster is weighted by its own clustering. Unlike in the
+    paper, the thresholds on weight, spread and mean are relative, so that they
+    do not depend on the size of the stream or the scale of the features. The
+    thresholds are set on :py:class:`MONIC`.
+
+    The statistics are undefined across a change of feature space. If the two
+    clusterings do not both carry points with the same number of features, every
+    survived cluster is reported as skipped instead.
+
+    >>> monic = MONIC()
+    >>> _ = monic.update(Clustering(0, {0: {1, 2}}, {1: 1.0, 2: 1.0}, {1: [0.0], 2: [2.0]}))
+    >>> report = monic.update(
+    ...     Clustering(
+    ...         1, {7: {1, 2, 3}}, dict.fromkeys([1, 2, 3], 1.0), {1: [0.0], 2: [2.0], 3: [1.0]}
+    ...     )
+    ... )
+    >>> (internal,) = report.internal
+    >>> sorted(kind.name for kind in internal.kinds)
+    ['COMPACTED', 'EXPANDED']
+    """
 
     source: int
     """The id of the cluster in the earlier clustering."""
@@ -447,17 +360,20 @@ class _Statistics(NamedTuple):
 def _statistics(clustering: Clustering, cluster_id: int) -> _Statistics | None:
     """Weighted statistics of a cluster, using the weights of its own clustering.
 
+    :param clustering: A clustering that carries points.
     :return: The weight of the cluster, its mean, the root mean square distance
         of its instances to the mean and its skewness in each feature, or ``None``
         if the cluster has no weight.
     """
+    vectors = clustering.points
+    assert vectors is not None, "Statistics need a clustering with points."
     instances = sorted(clustering.clusters[cluster_id])
     weights = np.array([clustering.weights[instance] for instance in instances])
     total = weights.sum()
     if total == 0.0:
         return None
 
-    points = np.array([clustering.points[instance] for instance in instances])
+    points = np.array([vectors[instance] for instance in instances])
     mean = weights @ points / total
     centred = points - mean
     variance = weights @ centred**2 / total
@@ -474,100 +390,6 @@ def _statistics(clustering: Clustering, cluster_id: int) -> _Statistics | None:
     return _Statistics(total, mean, float(np.sqrt(variance.sum())), skewness)
 
 
-def _check_internal_thresholds(
-    epsilon: float, delta: float, tau_mean: float, tau_skew: float
-) -> None:
-    if min(epsilon, delta, tau_mean, tau_skew) < 0.0:
-        raise ValueError("Thresholds must be non-negative.")
-
-
-def detect_internal_transitions(
-    source: Clustering,
-    target: Clustering,
-    transitions: Iterable[ExternalTransition],
-    epsilon: float = 0.1,
-    delta: float = 0.1,
-    tau_mean: float = 0.5,
-    tau_skew: float = 0.5,
-) -> tuple[InternalTransition, ...]:
-    """Detect the internal transitions of the survived clusters (Table 2).
-
-    A cluster is described by its weight, its mean, its spread ``sigma`` (the
-    root mean square distance of its instances to the mean) and its skewness in
-    each feature. Each cluster is weighted by its own clustering. Unlike in the
-    paper, the thresholds on weight, spread and mean are relative, so that they
-    do not depend on the size of the stream or the scale of the features.
-
-    The statistics are undefined across a change of feature space. If the two
-    clusterings do not both carry points with the same number of features, every
-    cluster is reported as skipped instead.
-
-    >>> source = Clustering(
-    ...     0, {0: {1, 2}}, {1: 1.0, 2: 1.0}, {1: [0.0], 2: [2.0]}
-    ... )
-    >>> target = Clustering(
-    ...     1, {7: {1, 2, 3}}, {1: 1.0, 2: 1.0, 3: 1.0}, {1: [0.0], 2: [2.0], 3: [1.0]}
-    ... )
-    >>> external = detect_external_transitions(source, target)
-    >>> (internal,) = detect_internal_transitions(source, target, external)
-    >>> sorted(kind.name for kind in internal.kinds)
-    ['COMPACTED', 'EXPANDED']
-
-    :param source: The clustering at the earlier timepoint ``t_i``.
-    :param target: The clustering at the later timepoint ``t_j``.
-    :param transitions: The external transitions from ``source`` to ``target``.
-        Only the survived clusters are analysed.
-    :param epsilon: The cluster shrinks or expands if its weight changes by more
-        than this fraction.
-    :param delta: The cluster becomes more compact or more diffuse if its
-        spread changes by more than this fraction.
-    :param tau_mean: The cluster shifts if its mean moves by more than this
-        fraction of its spread.
-    :param tau_skew: The cluster shifts if its skewness changes by more than
-        this in any feature.
-    :raises ValueError: If a threshold is negative.
-    :return: One internal transition for each survived cluster, in order.
-    """
-    _check_internal_thresholds(epsilon, delta, tau_mean, tau_skew)
-
-    comparable = (
-        source.n_features is not None and source.n_features == target.n_features
-    )
-
-    result = []
-    for transition in transitions:
-        if transition.kind is not TransitionType.SURVIVED:
-            continue
-        source_id = transition.source
-        (target_id,) = transition.targets
-        before = _statistics(source, source_id) if comparable else None
-        after = _statistics(target, target_id) if comparable else None
-        if before is None or after is None:
-            result.append(
-                InternalTransition(source_id, target_id, frozenset(), skipped=True)
-            )
-            continue
-
-        kinds = set()
-        if after.weight < (1 - epsilon) * before.weight:
-            kinds.add(TransitionType.SHRUNK)
-        elif after.weight > (1 + epsilon) * before.weight:
-            kinds.add(TransitionType.EXPANDED)
-
-        if after.spread < (1 - delta) * before.spread:
-            kinds.add(TransitionType.COMPACTED)
-        elif after.spread > (1 + delta) * before.spread:
-            kinds.add(TransitionType.DIFFUSED)
-
-        mean_shift = np.linalg.norm(after.mean - before.mean)
-        skew_shift = np.abs(after.skewness - before.skewness).max()
-        if mean_shift > tau_mean * before.spread or skew_shift > tau_skew:
-            kinds.add(TransitionType.SHIFTED)
-
-        result.append(InternalTransition(source_id, target_id, frozenset(kinds)))
-    return tuple(result)
-
-
 @dataclass(frozen=True)
 class Lifetime:
     """The lifetimes of a cluster (Definition 5).
@@ -576,6 +398,20 @@ class Lifetime:
     cluster, up to and including the timepoint of the clustering it belongs to.
     A new cluster has a lifetime of 1. ``strict <= internal <= absorption``
     always holds.
+
+    The paper computes lifetimes backward from the last clustering. A stream
+    has no last clustering, so they are counted forward instead:
+
+    * A cluster that survives passes all three lifetimes on, each extended by
+      one. The strict lifetime restarts at 1 if the cluster underwent an
+      internal transition, or if it was not shown to be free of one because
+      its internal analysis was skipped.
+    * A cluster that absorbed others continues the absorption lifetime of the
+      one sharing the most weight with it, extended by one. Ties go to the
+      longer absorption lifetime, then to the order of the earlier clustering.
+      Its other lifetimes restart at 1.
+    * Every other cluster is new: it emerged, or it is the result of a split.
+      A split extends no lifetime.
     """
 
     strict: int = 1
@@ -589,87 +425,15 @@ class Lifetime:
     cluster absorbed others (``lifetimeA``)."""
 
 
-def advance_lifetimes(
-    lifetimes: Mapping[int, Lifetime],
-    source: Clustering,
-    target: Clustering,
-    external: Iterable[ExternalTransition],
-    internal: Iterable[InternalTransition],
-) -> dict[int, Lifetime]:
-    """Lifetimes of the clusters of ``target``, given those of ``source``.
-
-    The paper computes lifetimes backward from the last clustering. A stream
-    has no last clustering, so they are counted forward instead:
-
-    * A cluster that survives passes all three lifetimes on, each extended by
-      one. The strict lifetime restarts at 1 if the cluster underwent an
-      internal transition, or if it was not shown to be free of one because
-      its internal analysis was skipped or is missing from ``internal``.
-    * A cluster that absorbed others continues the absorption lifetime of the
-      one sharing the most weight with it, extended by one. Ties go to the
-      longer absorption lifetime, then to the order of ``source``. Its other
-      lifetimes restart at 1.
-    * Every other cluster is new: it emerged, or it is the result of a split.
-      A split extends no lifetime.
-
-    Call it with an empty ``source`` to start a history:
-
-    >>> nothing = Clustering(0, {}, {})
-    >>> first = Clustering(1, {0: {1, 2}}, {1: 1.0, 2: 1.0})
-    >>> external = detect_external_transitions(nothing, first)
-    >>> advance_lifetimes({}, nothing, first, external, ())
-    {0: Lifetime(strict=1, internal=1, absorption=1)}
-
-    :param lifetimes: The lifetime of every cluster of ``source``, by cluster id.
-    :param source: The clustering at the earlier timepoint ``t_i``.
-    :param target: The clustering at the later timepoint ``t_j``.
-    :param external: The external transitions from ``source`` to ``target``.
-    :param internal: The internal transitions from ``source`` to ``target``.
-    :return: The lifetime of every cluster of ``target``, by cluster id.
-    """
-    unchanged = {
-        transition.source
-        for transition in internal
-        if not transition.skipped and not transition.kinds
-    }
-    intersections, _ = _intersection_weights(source, target)
-    row_of = {cluster_id: row for row, cluster_id in enumerate(source.clusters)}
-    column_of = {
-        cluster_id: column for column, cluster_id in enumerate(target.clusters)
-    }
-
-    continued: dict[int, Lifetime] = {}
-    absorbed_by: dict[int, list[int]] = {}
-    for transition in external:
-        if transition.kind is TransitionType.SURVIVED:
-            before = lifetimes[transition.source]
-            continued[transition.targets[0]] = Lifetime(
-                strict=before.strict + 1 if transition.source in unchanged else 1,
-                internal=before.internal + 1,
-                absorption=before.absorption + 1,
-            )
-        elif transition.kind is TransitionType.ABSORBED:
-            absorbed_by.setdefault(transition.targets[0], []).append(transition.source)
-
-    for target_id, source_ids in absorbed_by.items():
-        dominant = max(
-            source_ids,
-            key=lambda source_id: (
-                intersections[row_of[source_id], column_of[target_id]],
-                lifetimes[source_id].absorption,
-                -row_of[source_id],
-            ),
-        )
-        continued[target_id] = Lifetime(absorption=lifetimes[dominant].absorption + 1)
-
-    return {
-        target_id: continued.get(target_id, Lifetime()) for target_id in target.clusters
-    }
-
-
 @dataclass(frozen=True)
 class PassforwardRatios:
-    """The survival and absorption ratios of a clustering (Definition 6)."""
+    """The survival and absorption ratios of a clustering (Definition 6).
+
+    These are ratios, divided by the number of clusters of the clustering, and
+    both are 0 for a clustering with no clusters. Table 3 of the paper is headed
+    "passforward ratios" but reports absolute numbers of clusters, so these
+    values do not match it directly.
+    """
 
     survival: float
     """The portion of the clusters that survived into the next clustering."""
@@ -680,35 +444,6 @@ class PassforwardRatios:
     def passforward(self) -> float:
         """The sum of the survival and absorption ratios."""
         return self.survival + self.absorption
-
-
-def passforward_ratios(external: Iterable[ExternalTransition]) -> PassforwardRatios:
-    """Survival and absorption ratios of a clustering (Definition 6).
-
-    These are ratios, divided by the number of clusters of the clustering.
-    Table 3 of the paper is headed "passforward ratios" but reports absolute
-    numbers of clusters, so the values returned here do not match it directly.
-
-    >>> source = Clustering(0, {0: {1, 2}, 1: {3, 4}}, dict.fromkeys(range(1, 5), 1.0))
-    >>> target = Clustering(1, {7: {1, 2}}, {1: 1.0, 2: 1.0})
-    >>> passforward_ratios(detect_external_transitions(source, target))
-    PassforwardRatios(survival=0.5, absorption=0.0)
-
-    :param external: The external transitions from the clustering to the next.
-    :return: The ratios of the earlier clustering, both 0 if it has no clusters.
-    """
-    kinds = Counter(
-        transition.kind
-        for transition in external
-        if transition.kind is not TransitionType.EMERGED
-    )
-    n_clusters = sum(kinds.values())
-    if n_clusters == 0:
-        return PassforwardRatios(0.0, 0.0)
-    return PassforwardRatios(
-        survival=kinds[TransitionType.SURVIVED] / n_clusters,
-        absorption=kinds[TransitionType.ABSORBED] / n_clusters,
-    )
 
 
 @dataclass(frozen=True)
@@ -724,9 +459,12 @@ class TransitionReport:
     """The overlap of every cluster of the earlier clustering to every cluster
     of the later one. See :py:func:`build_overlap_matrix`."""
     external: tuple[ExternalTransition, ...]
-    """See :py:func:`detect_external_transitions`."""
+    """The external transitions (Table 1): one for each cluster of the earlier
+    clustering, in order, followed by one for each emerged cluster of the later
+    clustering, in order."""
     internal: tuple[InternalTransition, ...]
-    """See :py:func:`detect_internal_transitions`."""
+    """The internal transitions (Table 2): one for each survived cluster of the
+    earlier clustering, in order."""
     lifetimes: Mapping[int, Lifetime]
     """The lifetime of every cluster of the later clustering, by cluster id."""
     ratios: PassforwardRatios
@@ -752,6 +490,8 @@ class MONIC:
     [('SURVIVED', 0, (7,)), ('DISAPPEARED', 1, ())]
     >>> report.lifetimes[7].internal
     2
+    >>> report.ratios
+    PassforwardRatios(survival=0.5, absorption=0.0)
     """
 
     overlap_weighting = "target"
@@ -773,12 +513,22 @@ class MONIC:
     ) -> None:
         """Construct a monitor.
 
-        :param tau: See :py:func:`detect_external_transitions`.
-        :param tau_split: See :py:func:`detect_external_transitions`.
-        :param epsilon: See :py:func:`detect_internal_transitions`.
-        :param delta: See :py:func:`detect_internal_transitions`.
-        :param tau_mean: See :py:func:`detect_internal_transitions`.
-        :param tau_skew: See :py:func:`detect_internal_transitions`.
+        :param tau: The least overlap for one cluster to be the match of another
+            (Definition 4). A cluster with a match survives, or is absorbed if
+            another cluster has the same match. Definition 4 restricts ``tau``
+            to ``[0.5, 1]``; a smaller value is accepted with a warning.
+        :param tau_split: The least overlap for a cluster to take part in a
+            split. A cluster without a match is split if the clusters it
+            overlaps by at least ``tau_split`` together overlap it by at least
+            ``tau``; otherwise it disappears.
+        :param epsilon: A survived cluster shrinks or expands if its weight
+            changes by more than this fraction.
+        :param delta: A survived cluster becomes more compact or more diffuse if
+            its spread changes by more than this fraction.
+        :param tau_mean: A survived cluster shifts if its mean moves by more than
+            this fraction of its spread.
+        :param tau_skew: A survived cluster shifts if its skewness changes by
+            more than this in any feature.
         :param debug: Check every report against the invariants of MONIC and
             raise an ``AssertionError`` if one is violated: the rows of the
             overlap matrix sum to 1 where they should and never to more, every
@@ -788,8 +538,19 @@ class MONIC:
         :raises ValueError: Unless ``0 < tau_split < tau <= 1`` and the other
             thresholds are non-negative.
         """
-        _check_external_thresholds(tau, tau_split)
-        _check_internal_thresholds(epsilon, delta, tau_mean, tau_skew)
+        if not 0.0 < tau_split < tau <= 1.0:
+            raise ValueError(
+                f"Thresholds must satisfy 0 < tau_split < tau <= 1, but got "
+                f"tau_split={tau_split} and tau={tau}."
+            )
+        if tau < 0.5:
+            warnings.warn(
+                f"tau={tau} is below 0.5, so a cluster may be matched by less "
+                "than half of its weight.",
+                stacklevel=2,
+            )
+        if min(epsilon, delta, tau_mean, tau_skew) < 0.0:
+            raise ValueError("Thresholds must be non-negative.")
         self.debug = debug
         self.tau = tau
         self.tau_split = tau_split
@@ -818,44 +579,270 @@ class MONIC:
         :return: The transitions from the previous clustering to this one. For
             the first clustering, every cluster has emerged.
         """
-        source = self._clustering
-        if source is None:
-            source_timepoint = None
-            source = Clustering(clustering.timepoint, {}, {})
-        elif clustering.timepoint <= source.timepoint:
+        previous = self._clustering
+        if previous is not None and clustering.timepoint <= previous.timepoint:
             raise ValueError(
                 f"Timepoint {clustering.timepoint} is not later than the previous "
-                f"timepoint {source.timepoint}."
+                f"timepoint {previous.timepoint}."
             )
+        # The first clustering is compared with an empty one.
+        if previous is None:
+            source = Clustering(clustering.timepoint, {}, {})
         else:
-            source_timepoint = source.timepoint
+            source = previous
 
-        external = _external_transitions(source, clustering, self.tau, self.tau_split)
-        internal = detect_internal_transitions(
-            source,
-            clustering,
-            external,
-            self.epsilon,
-            self.delta,
-            self.tau_mean,
-            self.tau_skew,
+        overlap_weights = _overlap_weights(source, clustering)
+        external = self._detect_external_transitions(
+            source, clustering, overlap_weights
         )
-        self._lifetimes = advance_lifetimes(
-            self._lifetimes, source, clustering, external, internal
+        internal = self._detect_internal_transitions(source, clustering, external)
+        self._lifetimes = self._advance_lifetimes(
+            self._lifetimes, source, clustering, overlap_weights, external, internal
         )
         self._clustering = clustering
         report = TransitionReport(
-            source_timepoint=source_timepoint,
+            source_timepoint=None if previous is None else previous.timepoint,
             target_timepoint=clustering.timepoint,
-            overlap=build_overlap_matrix(source, clustering),
+            overlap=overlap_weights.forward,
             external=external,
             internal=internal,
             lifetimes=dict(self._lifetimes),
-            ratios=passforward_ratios(external),
+            ratios=self._passforward_ratios(external),
         )
         if self.debug:
             _check_invariants(source, clustering, report)
         return report
+
+    def _detect_external_transitions(
+        self,
+        source: Clustering,
+        target: Clustering,
+        overlap_weights: _OverlapWeights,
+    ) -> tuple[ExternalTransition, ...]:
+        """Detect the external transitions from ``source`` to ``target`` (Table 1).
+
+        A cluster of ``source`` with a match in ``target`` survives, or is
+        absorbed if another cluster has the same match. The match is the cluster
+        with the largest overlap, provided that overlap is at least
+        :py:attr:`tau`. Ties are broken by the larger reverse overlap, then by
+        the order of the clusters in ``target``. A cluster without a match is
+        split if the clusters it overlaps by at least :py:attr:`tau_split`
+        together overlap it by at least :py:attr:`tau`; otherwise it disappears.
+
+        :param source: The clustering at the earlier timepoint ``t_i``.
+        :param target: The clustering at the later timepoint ``t_j``.
+        :param overlap_weights: The overlap weights of ``source`` to ``target``.
+        :return: One transition for each cluster of ``source``, in order,
+            followed by one for each emerged cluster of ``target``, in order.
+        """
+        forward = overlap_weights.forward
+        reverse = overlap_weights.reverse
+
+        # Pass 1: find the match of each cluster of ``source``, or failing that
+        # the clusters it is split into. A cluster with a match is never split.
+        match_of: dict[int, int] = {}
+        split_of: dict[int, list[int]] = {}
+        for row in range(len(source.clusters)):
+            candidates = np.flatnonzero(forward[row] >= self.tau).tolist()
+            if candidates:
+                match_of[row] = max(
+                    candidates,
+                    key=lambda column: (
+                        forward[row, column],
+                        reverse[row, column],
+                        -column,
+                    ),
+                )
+                continue
+            candidates = np.flatnonzero(forward[row] >= self.tau_split).tolist()
+            # Clusters are disjoint, so the overlap to their union is the sum of
+            # their intersection weights over the weight of the cluster.
+            union_weight = overlap_weights.intersections[row, candidates].sum()
+            total_weight = overlap_weights.source_totals[row]
+            if candidates and union_weight / total_weight >= self.tau:
+                split_of[row] = candidates
+
+        # Pass 2: a cluster of ``target`` matched by one cluster is its survival,
+        # and one matched by several has absorbed them.
+        n_matched_by = Counter(match_of.values())
+
+        target_ids = target.cluster_ids
+        transitions = []
+        produced: set[int] = set()
+        for row, source_id in enumerate(source.clusters):
+            if row in match_of:
+                column = match_of[row]
+                absorbed = n_matched_by[column] > 1
+                kind = TransitionType.ABSORBED if absorbed else TransitionType.SURVIVED
+                targets: tuple[int, ...] = (target_ids[column],)
+            elif row in split_of:
+                kind = TransitionType.SPLIT
+                targets = tuple(target_ids[column] for column in split_of[row])
+            else:
+                kind = TransitionType.DISAPPEARED
+                targets = ()
+            produced.update(targets)
+            transitions.append(ExternalTransition(kind, source_id, targets))
+
+        transitions.extend(
+            ExternalTransition(TransitionType.EMERGED, None, (target_id,))
+            for target_id in target_ids
+            if target_id not in produced
+        )
+        return tuple(transitions)
+
+    def _detect_internal_transitions(
+        self,
+        source: Clustering,
+        target: Clustering,
+        external: Iterable[ExternalTransition],
+    ) -> tuple[InternalTransition, ...]:
+        """Detect the internal transitions of the survived clusters (Table 2).
+
+        See :py:class:`InternalTransition` for the statistics compared.
+
+        :param source: The clustering at the earlier timepoint ``t_i``.
+        :param target: The clustering at the later timepoint ``t_j``.
+        :param external: The external transitions from ``source`` to ``target``.
+            Only the survived clusters are analysed.
+        :return: One internal transition for each survived cluster, in order.
+        """
+        comparable = (
+            source.n_features is not None and source.n_features == target.n_features
+        )
+
+        result = []
+        for transition in external:
+            if transition.kind is not TransitionType.SURVIVED:
+                continue
+            source_id = transition.source
+            assert source_id is not None, "Only an emerged cluster has no source."
+            (target_id,) = transition.targets
+            before = _statistics(source, source_id) if comparable else None
+            after = _statistics(target, target_id) if comparable else None
+            if before is None or after is None:
+                result.append(
+                    InternalTransition(source_id, target_id, frozenset(), skipped=True)
+                )
+            else:
+                kinds = self._internal_kinds(before, after)
+                result.append(InternalTransition(source_id, target_id, kinds))
+        return tuple(result)
+
+    def _internal_kinds(
+        self, before: _Statistics, after: _Statistics
+    ) -> frozenset[TransitionType]:
+        """The internal transitions of a cluster, given its statistics at ``t_i``
+        and ``t_j``."""
+        kinds = set()
+        if after.weight < (1 - self.epsilon) * before.weight:
+            kinds.add(TransitionType.SHRUNK)
+        elif after.weight > (1 + self.epsilon) * before.weight:
+            kinds.add(TransitionType.EXPANDED)
+
+        if after.spread < (1 - self.delta) * before.spread:
+            kinds.add(TransitionType.COMPACTED)
+        elif after.spread > (1 + self.delta) * before.spread:
+            kinds.add(TransitionType.DIFFUSED)
+
+        mean_shift = np.linalg.norm(after.mean - before.mean)
+        skew_shift = np.abs(after.skewness - before.skewness).max()
+        if mean_shift > self.tau_mean * before.spread or skew_shift > self.tau_skew:
+            kinds.add(TransitionType.SHIFTED)
+        return frozenset(kinds)
+
+    @staticmethod
+    def _advance_lifetimes(
+        lifetimes: Mapping[int, Lifetime],
+        source: Clustering,
+        target: Clustering,
+        overlap_weights: _OverlapWeights,
+        external: Iterable[ExternalTransition],
+        internal: Iterable[InternalTransition],
+    ) -> dict[int, Lifetime]:
+        """Lifetimes of the clusters of ``target``, given those of ``source``.
+
+        See :py:class:`Lifetime` for the rules. A survived cluster whose
+        internal analysis is missing from ``internal`` is treated like one whose
+        analysis was skipped.
+
+        :param lifetimes: The lifetime of every cluster of ``source``, by
+            cluster id.
+        :param source: The clustering at the earlier timepoint ``t_i``.
+        :param target: The clustering at the later timepoint ``t_j``.
+        :param overlap_weights: The overlap weights of ``source`` to ``target``.
+        :param external: The external transitions from ``source`` to ``target``.
+        :param internal: The internal transitions from ``source`` to ``target``.
+        :return: The lifetime of every cluster of ``target``, by cluster id.
+        """
+        unchanged = {
+            transition.source
+            for transition in internal
+            if not transition.skipped and not transition.kinds
+        }
+        intersections = overlap_weights.intersections
+        row_of = {cluster_id: row for row, cluster_id in enumerate(source.clusters)}
+        column_of = {
+            cluster_id: column for column, cluster_id in enumerate(target.clusters)
+        }
+
+        continued: dict[int, Lifetime] = {}
+        absorbed_by: dict[int, list[int]] = {}
+        for transition in external:
+            source_id = transition.source
+            if source_id is None:
+                # An emerged cluster continues no lifetime.
+                continue
+            if transition.kind is TransitionType.SURVIVED:
+                before = lifetimes[source_id]
+                continued[transition.targets[0]] = Lifetime(
+                    strict=before.strict + 1 if source_id in unchanged else 1,
+                    internal=before.internal + 1,
+                    absorption=before.absorption + 1,
+                )
+            elif transition.kind is TransitionType.ABSORBED:
+                absorbed_by.setdefault(transition.targets[0], []).append(source_id)
+
+        for target_id, source_ids in absorbed_by.items():
+            dominant = max(
+                source_ids,
+                key=lambda source_id: (
+                    intersections[row_of[source_id], column_of[target_id]],
+                    lifetimes[source_id].absorption,
+                    -row_of[source_id],
+                ),
+            )
+            continued[target_id] = Lifetime(
+                absorption=lifetimes[dominant].absorption + 1
+            )
+
+        return {
+            target_id: continued.get(target_id, Lifetime())
+            for target_id in target.clusters
+        }
+
+    @staticmethod
+    def _passforward_ratios(
+        external: Iterable[ExternalTransition],
+    ) -> PassforwardRatios:
+        """Survival and absorption ratios of a clustering (Definition 6).
+
+        :param external: The external transitions from the clustering to the
+            next.
+        :return: The ratios of the earlier clustering.
+        """
+        kinds = Counter(
+            transition.kind
+            for transition in external
+            if transition.kind is not TransitionType.EMERGED
+        )
+        n_clusters = sum(kinds.values())
+        if n_clusters == 0:
+            return PassforwardRatios(0.0, 0.0)
+        return PassforwardRatios(
+            survival=kinds[TransitionType.SURVIVED] / n_clusters,
+            absorption=kinds[TransitionType.ABSORBED] / n_clusters,
+        )
 
 
 def _check_invariants(
@@ -931,7 +918,7 @@ class MonitorableClusterer(ABC):
 
     MONIC compares two clusterings instance by instance (Definition 3), so it needs
     the members of every cluster, not only its centre. A clusterer that
-    implements this interface can be monitored by :py:class:`MONICMonitor`:
+    implements this interface can be monitored with :py:class:`MONIC`:
 
     .. code-block:: python
 
@@ -966,93 +953,3 @@ class MonitorableClusterer(ABC):
 
         :return: The clusters of the model now, with their instances.
         """
-
-
-class MONICMonitor:
-    """Monitor the cluster transitions of a clusterer on a stream.
-
-    Every ``check_interval`` instances is a timepoint. At each timepoint the
-    monitor asks the clusterer for its current clustering (see
-    :py:class:`MonitorableClusterer`) and compares it with the clustering of the
-    previous timepoint (see :py:class:`MONIC`).
-
-    A transition describes how the clusterer's model changed between two
-    timepoints. It reflects a change in the data only once the model has
-    reacted to it.
-    """
-
-    def __init__(
-        self,
-        clusterer: Clusterer,
-        check_interval: int = 1000,
-        tau: float = 0.5,
-        tau_split: float = 0.1,
-        epsilon: float = 0.1,
-        delta: float = 0.1,
-        tau_mean: float = 0.5,
-        tau_skew: float = 0.5,
-        debug: bool = False,
-    ) -> None:
-        """Construct a monitor.
-
-        :param clusterer: The clusterer to train and monitor. It must implement
-            :py:class:`MonitorableClusterer`.
-        :param check_interval: The number of instances between timepoints.
-        :param tau: See :py:func:`detect_external_transitions`.
-        :param tau_split: See :py:func:`detect_external_transitions`.
-        :param epsilon: See :py:func:`detect_internal_transitions`.
-        :param delta: See :py:func:`detect_internal_transitions`.
-        :param tau_mean: See :py:func:`detect_internal_transitions`.
-        :param tau_skew: See :py:func:`detect_internal_transitions`.
-        :param debug: Check the invariants of MONIC at every timepoint. See
-            :py:class:`MONIC`.
-        :raises TypeError: If the clusterer does not implement
-            :py:class:`MonitorableClusterer`.
-        :raises ValueError: If ``check_interval`` is less than 1, or a threshold
-            is out of range. See :py:class:`MONIC`.
-        """
-        if not isinstance(clusterer, MonitorableClusterer):
-            raise TypeError(f"{clusterer} does not implement MonitorableClusterer.")
-        if check_interval < 1:
-            raise ValueError("The check interval must be at least 1.")
-        self.clusterer = clusterer
-        self.check_interval = check_interval
-        self.monic = MONIC(
-            tau, tau_split, epsilon, delta, tau_mean, tau_skew, debug=debug
-        )
-        self.instances_seen = 0
-
-    @property
-    def clustering(self) -> Clustering | None:
-        """The latest clustering, or ``None`` before the first timepoint."""
-        return self.monic.clustering
-
-    def train(self, instance: Instance) -> TransitionReport | None:
-        """Train the clusterer on an instance.
-
-        :param instance: The next instance of the stream.
-        :return: A report if the instance completes a timepoint, else ``None``.
-        """
-        self.clusterer.train(instance)
-        self.instances_seen += 1
-        if self.instances_seen % self.check_interval != 0:
-            return None
-        return self.monic.update(self.clusterer.get_clustering())
-
-    def monitor(
-        self, stream: Stream, max_instances: int | None = None
-    ) -> Iterator[TransitionReport]:
-        """Train on a stream, yielding a report at every timepoint.
-
-        :param stream: The stream to consume.
-        :param max_instances: Stop after this many instances, or ``None`` to
-            consume the whole stream.
-        """
-        n_instances = 0
-        while stream.has_more_instances() and (
-            max_instances is None or n_instances < max_instances
-        ):
-            report = self.train(stream.next_instance())
-            n_instances += 1
-            if report is not None:
-                yield report

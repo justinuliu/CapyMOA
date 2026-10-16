@@ -6,16 +6,26 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from capymoa.evaluation.monic import (
+    MONIC,
     Clustering,
-    Lifetime,
+    ExternalTransition,
     TransitionType,
-    advance_lifetimes,
-    detect_external_transitions,
-    detect_internal_transitions,
+    _overlap_weights,
     overlap,
 )
 
 WEIGHTS = [0.0, 0.25, 0.5, 1.0]
+
+
+def _external(
+    source: Clustering, target: Clustering, tau: float, tau_split: float
+) -> tuple[ExternalTransition, ...]:
+    """External transitions from ``source`` to ``target``, as detected by a MONIC
+    with the given thresholds."""
+    monic = MONIC(tau=tau, tau_split=tau_split)
+    return monic._detect_external_transitions(
+        source, target, _overlap_weights(source, target)
+    )
 
 
 @st.composite
@@ -59,7 +69,7 @@ def test_external_transitions_label_every_cluster_once(
     pair: tuple[Clustering, Clustering], tau: float, tau_split: float
 ):
     source, target = pair
-    transitions = detect_external_transitions(source, target, tau, tau_split)
+    transitions = _external(source, target, tau, tau_split)
     external = [t for t in transitions if t.kind is not TransitionType.EMERGED]
     emerged = [t for t in transitions if t.kind is TransitionType.EMERGED]
 
@@ -129,13 +139,9 @@ def histories(draw: st.DrawFn) -> list[Clustering]:
 @settings(max_examples=300, deadline=None, derandomize=True, database=None)
 @given(clusterings=histories(), tau=st.sampled_from([0.5, 0.6, 0.75]))
 def test_lifetimes_are_ordered(clusterings: list[Clustering], tau: float):
-    lifetimes: dict[int, Lifetime] = {}
-    source = Clustering(-1, {}, {})
+    monic = MONIC(tau=tau, tau_split=0.1)
     for n_timepoints, target in enumerate(clusterings, start=1):
-        external = detect_external_transitions(source, target, tau, 0.1)
-        internal = detect_internal_transitions(source, target, external)
-        lifetimes = advance_lifetimes(lifetimes, source, target, external, internal)
-        source = target
+        lifetimes = monic.update(target).lifetimes
 
         assert lifetimes.keys() == target.clusters.keys()
         for lifetime in lifetimes.values():

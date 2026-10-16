@@ -1,29 +1,22 @@
 import dataclasses
+from typing import TypedDict, Unpack
 
 import numpy as np
 import pytest
 
-from capymoa.base import Clusterer, ClusteringResult
-from capymoa.core import Instance
 from capymoa.evaluation.monic import (
     MONIC,
     Clustering,
     ExternalTransition,
     InternalTransition,
     Lifetime,
-    MONICMonitor,
-    MonitorableClusterer,
     PassforwardRatios,
     TransitionType,
     _check_invariants,
-    advance_lifetimes,
+    _overlap_weights,
     build_overlap_matrix,
-    detect_external_transitions,
-    detect_internal_transitions,
     overlap,
-    passforward_ratios,
 )
-from capymoa.stream import NumpyStream
 
 TOLERANCE = 1e-9
 
@@ -39,6 +32,33 @@ def _clustering(
             instance: 1.0 for instances in clusters.values() for instance in instances
         }
     return Clustering(timepoint, clusters, weights)
+
+
+def _external(
+    source: Clustering,
+    target: Clustering,
+    tau: float = 0.5,
+    tau_split: float = 0.1,
+) -> tuple[ExternalTransition, ...]:
+    """External transitions from ``source`` to ``target``, as detected by a MONIC
+    with the given thresholds."""
+    monic = MONIC(tau=tau, tau_split=tau_split)
+    return monic._detect_external_transitions(
+        source, target, _overlap_weights(source, target)
+    )
+
+
+def _advance_lifetimes(
+    lifetimes: dict[int, Lifetime],
+    source: Clustering,
+    target: Clustering,
+    external: tuple[ExternalTransition, ...],
+    internal: tuple[InternalTransition, ...],
+) -> dict[int, Lifetime]:
+    """Lifetimes of the clusters of ``target``, given those of ``source``."""
+    return MONIC._advance_lifetimes(
+        lifetimes, source, target, _overlap_weights(source, target), external, internal
+    )
 
 
 # Five clusters at t_i over instances 1..19.
@@ -226,7 +246,7 @@ def _detect(
     """
     if alive is None:
         alive = set().union(*target_clusters.values())
-    return detect_external_transitions(
+    return _external(
         _clustering(0, source_clusters),
         Clustering(1, target_clusters, dict.fromkeys(alive, 1.0)),
         tau=tau,
@@ -490,6 +510,15 @@ SHIFTED = TransitionType.SHIFTED
 Points = dict[int, list[float]]
 
 
+class _InternalThresholds(TypedDict, total=False):
+    """The thresholds of the internal transitions, as passed to MONIC."""
+
+    epsilon: float
+    delta: float
+    tau_mean: float
+    tau_skew: float
+
+
 def _cross(instances: range, radius: float = 1.0, centre: float = 0.0) -> Points:
     """Points at ``radius`` from ``(centre, 0)`` along both axes, repeated to
     cover ``instances``: mean ``(centre, 0)``, sigma ``radius`` and no skewness,
@@ -506,7 +535,7 @@ def _internal(
     target_points: Points,
     source_weights: dict[int, float] | None = None,
     target_weights: dict[int, float] | None = None,
-    **thresholds: float,
+    **thresholds: Unpack[_InternalThresholds],
 ) -> InternalTransition:
     """Internal transition of cluster 0, which survives as cluster 5."""
     source = Clustering(
@@ -521,12 +550,12 @@ def _internal(
         target_weights or dict.fromkeys(target_points, 1.0),
         target_points,
     )
-    external = detect_external_transitions(source, target)
+    external = _external(source, target)
     assert external == (ExternalTransition(TransitionType.SURVIVED, 0, (5,)),)
 
     with np.errstate(all="raise"):
-        (internal,) = detect_internal_transitions(
-            source, target, external, **thresholds
+        (internal,) = MONIC(**thresholds)._detect_internal_transitions(
+            source, target, external
         )
     return internal
 
@@ -695,8 +724,8 @@ def test_internal_skipped_without_points(missing: str):
         1, {5: set(points)}, weights, None if missing != "source" else points
     )
 
-    internal = detect_internal_transitions(
-        source, target, detect_external_transitions(source, target)
+    internal = MONIC()._detect_internal_transitions(
+        source, target, _external(source, target)
     )
 
     assert internal == (InternalTransition(0, 5, frozenset(), skipped=True),)
@@ -716,7 +745,7 @@ def test_internal_only_for_survived_clusters():
         {r: 1.0 for r in (0, 1, 2, 3, 4, 5, 10, 11)},
         points,
     )
-    external = detect_external_transitions(source, target)
+    external = _external(source, target)
     assert [t.kind for t in external] == [
         SURVIVED,
         ABSORBED,
@@ -725,7 +754,7 @@ def test_internal_only_for_survived_clusters():
         EMERGED,
     ]
 
-    internal = detect_internal_transitions(source, target, external)
+    internal = MONIC()._detect_internal_transitions(source, target, external)
 
     assert internal == (InternalTransition(0, 5, frozenset(), skipped=False),)
 
@@ -775,9 +804,9 @@ def _lifetime_history(
     source = Clustering(-1, {}, {})
     for timepoint, clusters in enumerate(clusterings):
         target = _unit_clustering(timepoint, clusters)
-        external = detect_external_transitions(source, target, tau=tau)
-        internal = detect_internal_transitions(source, target, external)
-        lifetimes = advance_lifetimes(lifetimes, source, target, external, internal)
+        external = _external(source, target, tau=tau)
+        internal = MONIC()._detect_internal_transitions(source, target, external)
+        lifetimes = _advance_lifetimes(lifetimes, source, target, external, internal)
         history.append(lifetimes)
         source = target
     return history
@@ -855,7 +884,7 @@ def test_five_timepoint_history_has_the_intended_transitions():
     source = Clustering(-1, {}, {})
     for timepoint, clusters in enumerate(FIVE_TIMEPOINTS):
         target = _unit_clustering(timepoint, clusters)
-        external = detect_external_transitions(source, target, tau=0.6)
+        external = _external(source, target, tau=0.6)
         kinds.append([t.kind for t in external])
         source = target
 
@@ -879,9 +908,9 @@ def test_absorption_continues_the_heavier_cluster():
     # younger and contributes 3.
     source = _unit_clustering(0, {0: {1, 2}, 1: {3, 4, 5}})
     target = _unit_clustering(1, {5: {1, 2, 3, 4, 5}})
-    external = detect_external_transitions(source, target)
+    external = _external(source, target)
 
-    lifetimes = advance_lifetimes(
+    lifetimes = _advance_lifetimes(
         {0: Lifetime(4, 6, 7), 1: Lifetime(1, 2, 2)}, source, target, external, ()
     )
 
@@ -891,9 +920,9 @@ def test_absorption_continues_the_heavier_cluster():
 def test_absorption_tie_continues_the_longer_lived_cluster():
     source = _unit_clustering(0, {0: {1, 2}, 1: {3, 4}})
     target = _unit_clustering(1, {5: {1, 2, 3, 4}})
-    external = detect_external_transitions(source, target)
+    external = _external(source, target)
 
-    lifetimes = advance_lifetimes(
+    lifetimes = _advance_lifetimes(
         {0: Lifetime(1, 2, 2), 1: Lifetime(4, 6, 7)}, source, target, external, ()
     )
 
@@ -903,10 +932,10 @@ def test_absorption_tie_continues_the_longer_lived_cluster():
 def test_split_extends_no_lifetime():
     source = _unit_clustering(0, {0: {1, 2, 3, 4}})
     target = _unit_clustering(1, {5: {1, 2}, 6: {3, 4}})
-    external = detect_external_transitions(source, target, tau=0.6)
+    external = _external(source, target, tau=0.6)
     assert [t.kind for t in external] == [SPLIT]
 
-    lifetimes = advance_lifetimes({0: Lifetime(4, 6, 7)}, source, target, external, ())
+    lifetimes = _advance_lifetimes({0: Lifetime(4, 6, 7)}, source, target, external, ())
 
     assert lifetimes == {5: Lifetime(1, 1, 1), 6: Lifetime(1, 1, 1)}
 
@@ -915,11 +944,11 @@ def test_match_takes_priority_over_split_child_for_lifetime():
     # Cluster 5 is the survival of cluster 0 and a split child of cluster 1.
     source = _unit_clustering(0, {0: {1, 2, 3, 4}, 1: {10, 11, 12, 13, 14, 15}})
     target = _unit_clustering(1, {5: {1, 2, 3, 4, 10, 11, 12}, 6: {13, 14, 15}})
-    external = detect_external_transitions(source, target, tau=0.7)
-    internal = detect_internal_transitions(source, target, external)
+    external = _external(source, target, tau=0.7)
+    internal = MONIC()._detect_internal_transitions(source, target, external)
     assert [t.kind for t in external] == [SURVIVED, SPLIT]
 
-    lifetimes = advance_lifetimes(
+    lifetimes = _advance_lifetimes(
         {0: Lifetime(3, 3, 3), 1: Lifetime(5, 5, 5)}, source, target, external, internal
     )
 
@@ -932,11 +961,11 @@ def test_skipped_internal_analysis_restarts_strict_lifetime():
     # be shown to be free of internal transitions.
     source = _clustering(0, {0: {1, 2}})
     target = _clustering(1, {5: {1, 2}})
-    external = detect_external_transitions(source, target)
-    internal = detect_internal_transitions(source, target, external)
+    external = _external(source, target)
+    internal = MONIC()._detect_internal_transitions(source, target, external)
     assert internal == (InternalTransition(0, 5, frozenset(), skipped=True),)
 
-    lifetimes = advance_lifetimes(
+    lifetimes = _advance_lifetimes(
         {0: Lifetime(3, 3, 3)}, source, target, external, internal
     )
 
@@ -947,7 +976,7 @@ def test_ratios_when_everything_survives():
     source = _unit_clustering(0, {0: {1, 2}, 1: {3, 4}, 2: {5}})
     target = _unit_clustering(1, {5: {1, 2}, 6: {3, 4}, 7: {5}, 8: {9}})
 
-    ratios = passforward_ratios(detect_external_transitions(source, target))
+    ratios = MONIC._passforward_ratios(_external(source, target))
 
     assert ratios == PassforwardRatios(survival=1.0, absorption=0.0)
     assert ratios.passforward == 1.0
@@ -957,7 +986,7 @@ def test_ratios_when_everything_dies():
     source = _unit_clustering(0, {0: {1, 2}, 1: {3, 4}, 2: {5}})
     target = _unit_clustering(1, {5: {10, 11}})
 
-    ratios = passforward_ratios(detect_external_transitions(source, target))
+    ratios = MONIC._passforward_ratios(_external(source, target))
 
     assert ratios == PassforwardRatios(survival=0.0, absorption=0.0)
     assert ratios.passforward == 0.0
@@ -968,7 +997,7 @@ def test_ratios_mixed():
     source = _unit_clustering(0, {0: {1, 2}, 1: {3, 4}, 2: {5, 6}, 3: {7, 8}})
     target = _unit_clustering(1, {5: {1, 2}, 6: {3, 4, 5, 6}, 7: {9}})
 
-    ratios = passforward_ratios(detect_external_transitions(source, target))
+    ratios = MONIC._passforward_ratios(_external(source, target))
 
     assert ratios == PassforwardRatios(survival=0.25, absorption=0.5)
     assert ratios.passforward == 0.75
@@ -979,16 +1008,16 @@ def test_ratios_do_not_count_splits():
     source = _unit_clustering(0, {0: {1, 2}, 1: {3, 4, 5, 6}})
     target = _unit_clustering(1, {5: {1, 2}, 6: {3, 4}, 7: {5, 6}})
 
-    ratios = passforward_ratios(detect_external_transitions(source, target, tau=0.6))
+    ratios = MONIC._passforward_ratios(_external(source, target, tau=0.6))
 
     assert ratios == PassforwardRatios(survival=0.5, absorption=0.0)
 
 
 def test_ratios_of_empty_clustering_are_zero():
     target = _unit_clustering(1, {5: {1, 2}})
-    external = detect_external_transitions(Clustering(0, {}, {}), target)
+    external = _external(Clustering(0, {}, {}), target)
 
-    assert passforward_ratios(external) == PassforwardRatios(0.0, 0.0)
+    assert MONIC._passforward_ratios(external) == PassforwardRatios(0.0, 0.0)
 
 
 # MONIC over a sequence of clusterings.
@@ -1055,149 +1084,16 @@ def test_garbage_cluster_wins_matches_unless_dissolved():
     source = _unit_clustering(0, {0: {1, 2, 3, 4}})
     target = _unit_clustering(1, {9: {1, 2, 3, 4, 20, 21, 22, 23, 24}, 5: {30, 31}})
 
-    assert detect_external_transitions(source, target) == (
+    assert _external(source, target) == (
         ExternalTransition(SURVIVED, 0, (9,)),
         ExternalTransition(EMERGED, None, (5,)),
     )
-    assert detect_external_transitions(source, target.without_clusters([9])) == (
+    assert _external(source, target.without_clusters([9])) == (
         ExternalTransition(DISAPPEARED, 0, ()),
         ExternalTransition(EMERGED, None, (5,)),
     )
     # The dissolved instances are still alive, so they keep their weights.
     assert target.without_clusters([9]).weights == target.weights
-
-
-# Monitoring a clusterer.
-
-
-def _stream(n_instances: int) -> NumpyStream:
-    """A stream whose instance ``i`` has the single feature ``i``."""
-    return NumpyStream(
-        np.arange(n_instances, dtype=float)[:, np.newaxis],
-        np.zeros(n_instances, dtype=int),
-        target_type="categorical",
-    )
-
-
-class _PlainClusterer(Clusterer):
-    """A clusterer that records what it is trained on and has no clusters."""
-
-    def __init__(self):
-        super().__init__(_stream(1).get_schema())
-        self.trained: list[float] = []
-
-    def __str__(self):
-        return "PlainClusterer"
-
-    def train(self, instance: Instance):
-        self.trained.append(float(instance.x[0]))
-
-    def implements_micro_clusters(self) -> bool:
-        return False
-
-    def implements_macro_clusters(self) -> bool:
-        return False
-
-    def _get_micro_clusters_centers(self):
-        return []
-
-    def _get_micro_clusters_radii(self):
-        return []
-
-    def _get_micro_clusters_weights(self):
-        return []
-
-    def _get_clusters_centers(self):
-        return []
-
-    def _get_clusters_radii(self):
-        return []
-
-    def _get_clusters_weights(self):
-        return []
-
-    def get_clustering_result(self):
-        return ClusteringResult([], [], [], [])
-
-    def get_micro_clustering_result(self):
-        return ClusteringResult([], [], [], [])
-
-
-class _ScriptedClusterer(_PlainClusterer, MonitorableClusterer):
-    """A clusterer whose clusterings are given in advance, one per call."""
-
-    def __init__(self, clusterings: list[Clustering]):
-        super().__init__()
-        self.clusterings = iter(clusterings)
-
-    def get_clustering(self) -> Clustering:
-        return next(self.clusterings)
-
-
-# Cluster 0 splits in two at timepoint 2, while cluster 1 survives. At
-# timepoint 3 instances 1 and 2 have aged out, so the cluster holding them
-# disappears, and the other two are absorbed by one cluster.
-SCRIPT = [
-    _unit_clustering(1, {0: {1, 2, 3, 4}, 1: {5, 6}}),
-    _unit_clustering(2, {0: {1, 2}, 1: {3, 4}, 2: {5, 6, 7}}),
-    _unit_clustering(3, {0: {3, 4, 5, 6, 7}}),
-]
-
-
-def test_monitor_asks_for_a_clustering_at_every_interval():
-    clusterer = _ScriptedClusterer(SCRIPT)
-    monitor = MONICMonitor(clusterer, check_interval=2, tau=0.6, debug=True)
-    stream = _stream(7)
-
-    reports = [monitor.train(stream.next_instance()) for _ in range(7)]
-
-    assert [report is not None for report in reports] == [
-        False,
-        True,
-        False,
-        True,
-        False,
-        True,
-        False,
-    ]
-    assert clusterer.trained == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    assert monitor.instances_seen == 7
-    assert monitor.clustering is SCRIPT[2]
-    assert [report.external for report in reports if report is not None] == [
-        (
-            ExternalTransition(EMERGED, None, (0,)),
-            ExternalTransition(EMERGED, None, (1,)),
-        ),
-        (
-            ExternalTransition(SPLIT, 0, (0, 1)),
-            ExternalTransition(SURVIVED, 1, (2,)),
-        ),
-        (
-            ExternalTransition(DISAPPEARED, 0, ()),
-            ExternalTransition(ABSORBED, 1, (0,)),
-            ExternalTransition(ABSORBED, 2, (0,)),
-        ),
-    ]
-
-
-def test_monitor_stops_at_max_instances():
-    monitor = MONICMonitor(_ScriptedClusterer(SCRIPT), check_interval=2, tau=0.6)
-
-    reports = list(monitor.monitor(_stream(10), max_instances=5))
-
-    assert [report.target_timepoint for report in reports] == [1, 2]
-    assert monitor.instances_seen == 5
-
-
-def test_monitor_rejects_clusterer_without_clusterings():
-    with pytest.raises(TypeError, match="does not implement MonitorableClusterer"):
-        MONICMonitor(_PlainClusterer())
-
-
-@pytest.mark.parametrize("kwargs", [{"check_interval": 0}, {"tau_split": 0.9}])
-def test_monitor_validates_arguments(kwargs: dict):
-    with pytest.raises(ValueError):
-        MONICMonitor(_ScriptedClusterer([]), **kwargs)
 
 
 # The runtime invariant checks of debug mode.
